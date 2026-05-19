@@ -1,4 +1,29 @@
 use worker::*;
+use serde::{Deserialize, Serialize};
+
+// Telegram Update models
+#[derive(Deserialize, Serialize, Debug)]
+pub struct Update {
+    pub message: Option<Message>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct User {
+    pub id: i64,
+    pub username: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Chat {
+    pub id: i64,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Message {
+    pub text: Option<String>,
+    pub chat: Chat,
+    pub from: Option<User>,
+}
 
 pub struct TelegramService;
 

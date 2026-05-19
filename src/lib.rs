@@ -1,5 +1,4 @@
 use worker::*;
-use serde::{Deserialize, Serialize};
 
 mod parser;
 mod google;
@@ -8,32 +7,8 @@ mod operations;
 
 use parser::ParserService;
 use google::GoogleSheetsService;
-use telegram::TelegramService;
+use telegram::{Update, TelegramService};
 use operations::OperationsService;
-
-// Telegram Update models
-#[derive(Deserialize, Serialize, Debug)]
-struct Update {
-    message: Option<Message>,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-struct User {
-    id: i64,
-    username: Option<String>,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-struct Chat {
-    id: i64,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-struct Message {
-    text: Option<String>,
-    chat: Chat,
-    from: Option<User>,
-}
 
 fn get_env_or_secret(env: &Env, name: &str, default: &str) -> String {
     env.secret(name)
