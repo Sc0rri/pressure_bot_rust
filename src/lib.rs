@@ -1,7 +1,6 @@
 use worker::*;
 use serde::{Deserialize, Serialize};
 use jwt_simple::prelude::*;
-use std::collections::HashMap;
 
 // We need to parse raw Google credentials
 #[derive(Deserialize)]
@@ -41,51 +40,21 @@ struct Message {
     from: Option<User>,
 }
 
-#[derive(Debug, Clone)]
-struct DetectResult {
-    result_type: String,
-    data: HashMap<String, String>,
-    raw_text: String,
+#[derive(Debug, Clone, PartialEq)]
+enum Action {
+    Pressure {
+        sys: i32,
+        dia: i32,
+        pulse: Option<i32>,
+    },
+    Cost {
+        amount: i32,
+        comment: String,
+    },
 }
 
-impl DetectResult {
-    fn unknown(raw_text: &str) -> Self {
-        Self {
-            result_type: "unknown".to_string(),
-            data: HashMap::new(),
-            raw_text: raw_text.to_string(),
-        }
-    }
-}
-
-// Custom URL encoder for Wasm target, supporting special characters and Cyrillic
-fn url_encode(s: &str) -> String {
-    let mut encoded = String::new();
-    for b in s.bytes() {
-        match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(b as char);
-            }
-            b' ' => {
-                encoded.push_str("%20");
-            }
-            _ => {
-                encoded.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    encoded
-}
-
-// Resilient helper to read from Cloudflare secrets, standard vars, or fall back to defaults
-fn get_env_or_secret(env: &Env, name: &str, default: &str) -> String {
-    env.secret(name)
-        .map(|v| v.to_string())
-        .or_else(|_| env.var(name).map(|v| v.to_string()))
-        .unwrap_or_else(|_| default.to_string())
-}
-
-fn detect_type(text: &str) -> DetectResult {
+// Parser for pressure in strict auto-detection mode
+fn parse_as_pressure(text: &str) -> Option<Action> {
     let clean = text.trim();
     let parts: Vec<&str> = clean
         .split(|c: char| c.is_whitespace() || c == '\\' || c == '/' || c == '|')
@@ -95,52 +64,122 @@ fn detect_type(text: &str) -> DetectResult {
     let mut nums = Vec::new();
     let mut words = Vec::new();
     for p in parts {
-        if p.parse::<i32>().is_ok() {
-            nums.push(p.to_string());
+        if let Ok(num) = p.parse::<i32>() {
+            nums.push(num);
         } else {
-            words.push(p.to_string());
+            words.push(p);
         }
     }
 
-    // PRESSURE
     if words.is_empty() && (nums.len() == 2 || nums.len() == 3) {
-        let sys = nums[0].parse::<i32>().unwrap_or(0);
-        let dia = nums[1].parse::<i32>().unwrap_or(0);
-        if sys >= 80 && sys <= 250 && dia >= 40 && dia <= 150 {
-            let mut pulse = String::new();
+        let sys = nums[0];
+        let dia = nums[1];
+        if (80..=250).contains(&sys) && (40..=150).contains(&dia) {
+            let mut pulse = None;
             if nums.len() == 3 {
-                let p = nums[2].parse::<i32>().unwrap_or(0);
-                if p >= 40 && p <= 200 {
-                    pulse = nums[2].clone();
+                let p = nums[2];
+                if (40..=200).contains(&p) {
+                    pulse = Some(p);
                 } else {
-                    return DetectResult::unknown(text);
+                    return None;
                 }
             }
-            let mut data = HashMap::new();
-            data.insert("sys".to_string(), nums[0].clone());
-            data.insert("dia".to_string(), nums[1].clone());
-            data.insert("pulse".to_string(), pulse);
-            return DetectResult {
-                result_type: "pressure".to_string(),
-                data,
-                raw_text: text.to_string(),
-            };
+            return Some(Action::Pressure { sys, dia, pulse });
+        }
+    }
+    None
+}
+
+// Parser for manual pressure option (from KV store payload)
+fn parse_manual_pressure(text: &str) -> Option<Action> {
+    let clean = text.trim();
+    let parts: Vec<&str> = clean
+        .split(|c: char| c.is_whitespace() || c == '\\' || c == '/' || c == '|')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut nums = Vec::new();
+    for p in parts {
+        if let Ok(num) = p.parse::<i32>() {
+            nums.push(num);
         }
     }
 
-    // COST
-    if nums.len() == 1 {
-        let mut data = HashMap::new();
-        data.insert("amount".to_string(), nums[0].clone());
-        data.insert("comment".to_string(), words.join(" "));
-        return DetectResult {
-            result_type: "cost".to_string(),
-            data,
-            raw_text: text.to_string(),
-        };
+    if nums.len() >= 2 {
+        let sys = nums[0];
+        let dia = nums[1];
+        let pulse = nums.get(2).copied();
+        Some(Action::Pressure { sys, dia, pulse })
+    } else {
+        None
+    }
+}
+
+// Parser for manual cost option (from KV store payload)
+fn parse_manual_cost(text: &str) -> Option<Action> {
+    let clean = text.trim();
+    let parts: Vec<&str> = clean
+        .split(|c: char| c.is_whitespace() || c == '\\' || c == '/' || c == '|')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut amount = None;
+    let mut comment_parts = Vec::new();
+
+    for p in parts {
+        if let Ok(num) = p.parse::<i32>() {
+            if amount.is_none() {
+                amount = Some(num);
+                continue;
+            }
+        }
+        comment_parts.push(p);
     }
 
-    DetectResult::unknown(text)
+    amount.map(|amt| Action::Cost {
+        amount: amt,
+        comment: comment_parts.join(" "),
+    })
+}
+
+// Default classification flow
+fn detect_action(text: &str) -> Option<Action> {
+    if let Some(pressure) = parse_as_pressure(text) {
+        return Some(pressure);
+    }
+
+    let clean = text.trim();
+    let parts: Vec<&str> = clean
+        .split(|c: char| c.is_whitespace() || c == '\\' || c == '/' || c == '|')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut nums = Vec::new();
+    let mut words = Vec::new();
+    for p in parts {
+        if let Ok(num) = p.parse::<i32>() {
+            nums.push(num);
+        } else {
+            words.push(p);
+        }
+    }
+
+    if nums.len() == 1 {
+        return Some(Action::Cost {
+            amount: nums[0],
+            comment: words.join(" "),
+        });
+    }
+
+    None
+}
+
+// Resilient helper to read from Cloudflare secrets, standard vars, or fall back to defaults
+fn get_env_or_secret(env: &Env, name: &str, default: &str) -> String {
+    env.secret(name)
+        .map(|v| v.to_string())
+        .or_else(|_| env.var(name).map(|v| v.to_string()))
+        .unwrap_or_else(|_| default.to_string())
 }
 
 async fn get_google_token(env: &Env) -> Result<String> {
@@ -245,9 +284,9 @@ async fn add_pressure(
     pressure_sheet_id: i64,
     pressure_sheet: &str,
     tz_str: &str,
-    sys: &str,
-    dia: &str,
-    pulse: &str,
+    sys: i32,
+    dia: i32,
+    pulse: Option<i32>,
 ) -> Result<()> {
     let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::Europe::Kiev);
     let local_time = chrono::Utc::now().with_timezone(&tz);
@@ -282,16 +321,17 @@ async fn add_pressure(
     // 2. Update values at A3 (replicating Go's original logic). 
     // We wrap sheet name in single quotes and URL encode it to avoid spaces and parentheses issues.
     let range_raw = format!("'{}'!A3", pressure_sheet);
-    let range_encoded = url_encode(&range_raw);
+    let range_encoded = urlencoding::encode(&range_raw);
     
     let update_url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption=USER_ENTERED",
         sheet_id,
         range_encoded
     );
+    let pulse_val = pulse.map(|p| p.to_string()).unwrap_or_default();
     let values_payload = serde_json::json!({
         "values": [
-            [timestamp, sys, dia, pulse]
+            [timestamp, sys.to_string(), dia.to_string(), pulse_val]
         ]
     });
     
@@ -311,7 +351,7 @@ async fn add_cost(
     costs_sheet: &str,
     _costs_sheet_id: i64, // kept for exact GID config matching
     tz_str: &str,
-    amount: &str,
+    amount: i32,
     comment: &str,
 ) -> Result<()> {
     let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::Europe::Kiev);
@@ -320,7 +360,7 @@ async fn add_cost(
 
     // We wrap sheet name in single quotes and URL encode it to avoid spaces and parentheses issues.
     let range_raw = format!("'{}'!A2", costs_sheet);
-    let range_encoded = url_encode(&range_raw);
+    let range_encoded = urlencoding::encode(&range_raw);
 
     let append_url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS",
@@ -329,7 +369,7 @@ async fn add_cost(
     );
     let append_payload = serde_json::json!({
         "values": [
-            [timestamp, amount, comment]
+            [timestamp, amount.to_string(), comment]
         ]
     });
     
@@ -392,6 +432,55 @@ fn remove_keyboard() -> serde_json::Value {
     serde_json::json!({
         "remove_keyboard": true
     })
+}
+
+async fn execute_action(
+    env: &Env,
+    token: &str,
+    bot_token: &str,
+    chat_id: i64,
+    action: Action,
+) -> Result<()> {
+    let sheet_id = env.secret("SHEET_ID")?.to_string();
+    let tz_str = get_env_or_secret(env, "TIMEZONE", "Europe/Kiev");
+
+    match action {
+        Action::Pressure { sys, dia, pulse } => {
+            let pressure_sheet = get_env_or_secret(env, "PRESSURE_SHEET", "pressure");
+            let pressure_sheet_id: i64 = get_env_or_secret(env, "PRESSURE_SHEET_ID", "0")
+                .parse()
+                .unwrap_or(0);
+            
+            if let Err(e) = add_pressure(env, token, &sheet_id, pressure_sheet_id, &pressure_sheet, &tz_str, sys, dia, pulse).await {
+                console_log!("add_pressure failed: {:?}", e);
+                send_telegram_message(bot_token, chat_id, &format!("❌ Error saving pressure: {}", e), Some(remove_keyboard())).await?;
+            } else {
+                let mut msg = format!("✅ Pressure saved: {}/{}", sys, dia);
+                if let Some(p) = pulse {
+                    msg.push_str(&format!(" pulse {}", p));
+                }
+                send_telegram_message(bot_token, chat_id, &msg, Some(remove_keyboard())).await?;
+            }
+        }
+        Action::Cost { amount, comment } => {
+            let costs_sheet = get_env_or_secret(env, "COSTS_SHEET", "costs");
+            let costs_sheet_id: i64 = get_env_or_secret(env, "COSTS_SHEET_ID", "0")
+                .parse()
+                .unwrap_or(0);
+
+            if let Err(e) = add_cost(env, token, &sheet_id, &costs_sheet, costs_sheet_id, &tz_str, amount, &comment).await {
+                console_log!("add_cost failed: {:?}", e);
+                send_telegram_message(bot_token, chat_id, &format!("❌ Error saving cost: {}", e), Some(remove_keyboard())).await?;
+            } else {
+                let mut msg = format!("✅ Cost saved: {}", amount);
+                if !comment.is_empty() {
+                    msg.push_str(&format!(" {}", comment));
+                }
+                send_telegram_message(bot_token, chat_id, &msg, Some(remove_keyboard())).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[event(fetch)]
@@ -485,68 +574,21 @@ async fn fetch(
             match text.as_str() {
                 "🩺 Pressure" => {
                     kv.delete(&chat_key).await?;
-                    let nums: Vec<&str> = pending_text.split_whitespace().collect();
-                    if nums.len() < 2 {
-                        send_telegram_message(&bot_token, chat_id, "❌ Need at least 2 numbers: sys dia", Some(remove_keyboard())).await?;
-                        let res = Response::empty()?;
-                        return Ok(res.try_into()?);
-                    }
-                    let pulse = if nums.len() >= 3 { nums[2] } else { "" };
-                    
-                    let sheet_id = env.secret("SHEET_ID")?.to_string();
-                    let pressure_sheet = get_env_or_secret(&env, "PRESSURE_SHEET", "pressure");
-                    let pressure_sheet_id: i64 = get_env_or_secret(&env, "PRESSURE_SHEET_ID", "0")
-                        .parse()
-                        .unwrap_or(0);
-                    let tz_str = get_env_or_secret(&env, "TIMEZONE", "Europe/Kiev");
-                    
-                    if let Err(e) = add_pressure(&env, &token, &sheet_id, pressure_sheet_id, &pressure_sheet, &tz_str, nums[0], nums[1], pulse).await {
-                        console_log!("add_pressure failed: {:?}", e);
-                        send_telegram_message(&bot_token, chat_id, &format!("❌ Error saving pressure: {}", e), Some(remove_keyboard())).await?;
+                    if let Some(action) = parse_manual_pressure(&pending_text) {
+                        execute_action(&env, &token, &bot_token, chat_id, action).await?;
                     } else {
-                        let mut msg = format!("✅ Pressure saved: {}/{}", nums[0], nums[1]);
-                        if !pulse.is_empty() {
-                            msg.push_str(&format!(" pulse {}", pulse));
-                        }
-                        send_telegram_message(&bot_token, chat_id, &msg, Some(remove_keyboard())).await?;
+                        send_telegram_message(&bot_token, chat_id, "❌ Need at least 2 numbers: sys dia", Some(remove_keyboard())).await?;
                     }
-                    
                     let res = Response::empty()?;
                     return Ok(res.try_into()?);
                 }
                 "💸 Cost" => {
                     kv.delete(&chat_key).await?;
-                    let parts: Vec<&str> = pending_text.split_whitespace().collect();
-                    let mut amount = String::new();
-                    let mut comment_parts = Vec::new();
-                    
-                    for p in parts {
-                        if p.parse::<i32>().is_ok() && amount.is_empty() {
-                            amount = p.to_string();
-                        } else {
-                            comment_parts.push(p);
-                        }
-                    }
-                    let comment = comment_parts.join(" ");
-                    
-                    let sheet_id = env.secret("SHEET_ID")?.to_string();
-                    let costs_sheet = get_env_or_secret(&env, "COSTS_SHEET", "costs");
-                    let costs_sheet_id: i64 = get_env_or_secret(&env, "COSTS_SHEET_ID", "0")
-                        .parse()
-                        .unwrap_or(0);
-                    let tz_str = get_env_or_secret(&env, "TIMEZONE", "Europe/Kiev");
-                    
-                    if let Err(e) = add_cost(&env, &token, &sheet_id, &costs_sheet, costs_sheet_id, &tz_str, &amount, &comment).await {
-                        console_log!("add_cost failed: {:?}", e);
-                        send_telegram_message(&bot_token, chat_id, &format!("❌ Error saving cost: {}", e), Some(remove_keyboard())).await?;
+                    if let Some(action) = parse_manual_cost(&pending_text) {
+                        execute_action(&env, &token, &bot_token, chat_id, action).await?;
                     } else {
-                        let mut msg = format!("✅ Cost saved: {}", amount);
-                        if !comment.is_empty() {
-                            msg.push_str(&format!(" {}", comment));
-                        }
-                        send_telegram_message(&bot_token, chat_id, &msg, Some(remove_keyboard())).await?;
+                        send_telegram_message(&bot_token, chat_id, "❌ Invalid cost format", Some(remove_keyboard())).await?;
                     }
-                    
                     let res = Response::empty()?;
                     return Ok(res.try_into()?);
                 }
@@ -561,60 +603,14 @@ async fn fetch(
         }
 
         // 4. Default classification flow
-        let res = detect_type(&text);
-        console_log!("DETECTED: type={} data={:?}", res.result_type, res.data);
-
-        match res.result_type.as_str() {
-            "pressure" => {
-                let sys = res.data.get("sys").unwrap();
-                let dia = res.data.get("dia").unwrap();
-                let pulse = res.data.get("pulse").unwrap();
-                
-                let sheet_id = env.secret("SHEET_ID")?.to_string();
-                let pressure_sheet = get_env_or_secret(&env, "PRESSURE_SHEET", "pressure");
-                let pressure_sheet_id: i64 = get_env_or_secret(&env, "PRESSURE_SHEET_ID", "0")
-                    .parse()
-                    .unwrap_or(0);
-                let tz_str = get_env_or_secret(&env, "TIMEZONE", "Europe/Kiev");
-                
-                if let Err(e) = add_pressure(&env, &token, &sheet_id, pressure_sheet_id, &pressure_sheet, &tz_str, sys, dia, pulse).await {
-                    console_log!("add_pressure failed: {:?}", e);
-                    send_telegram_message(&bot_token, chat_id, &format!("❌ Error saving pressure: {}", e), Some(remove_keyboard())).await?;
-                } else {
-                    let mut msg = format!("✅ Pressure saved: {}/{}", sys, dia);
-                    if !pulse.is_empty() {
-                        msg.push_str(&format!(" pulse {}", pulse));
-                    }
-                    send_telegram_message(&bot_token, chat_id, &msg, Some(remove_keyboard())).await?;
-                }
-            }
-            "cost" => {
-                let amount = res.data.get("amount").unwrap();
-                let comment = res.data.get("comment").unwrap();
-                
-                let sheet_id = env.secret("SHEET_ID")?.to_string();
-                let costs_sheet = get_env_or_secret(&env, "COSTS_SHEET", "costs");
-                let costs_sheet_id: i64 = get_env_or_secret(&env, "COSTS_SHEET_ID", "0")
-                    .parse()
-                    .unwrap_or(0);
-                let tz_str = get_env_or_secret(&env, "TIMEZONE", "Europe/Kiev");
-                
-                if let Err(e) = add_cost(&env, &token, &sheet_id, &costs_sheet, costs_sheet_id, &tz_str, amount, comment).await {
-                    console_log!("add_cost failed: {:?}", e);
-                    send_telegram_message(&bot_token, chat_id, &format!("❌ Error saving cost: {}", e), Some(remove_keyboard())).await?;
-                } else {
-                    let mut msg = format!("✅ Cost saved: {}", amount);
-                    if !comment.is_empty() {
-                        msg.push_str(&format!(" {}", comment));
-                    }
-                    send_telegram_message(&bot_token, chat_id, &msg, Some(remove_keyboard())).await?;
-                }
-            }
-            _ => {
-                // Unknown action: save to KV and offer menu
-                kv.put(&chat_key, &text)?.expiration_ttl(600).execute().await?;
-                send_telegram_message(&bot_token, chat_id, "Where to save?", Some(choose_keyboard())).await?;
-            }
+        if let Some(action) = detect_action(&text) {
+            console_log!("DETECTED: {:?}", action);
+            execute_action(&env, &token, &bot_token, chat_id, action).await?;
+        } else {
+            console_log!("DETECTED: unknown");
+            // Unknown action: save to KV and offer menu
+            kv.put(&chat_key, &text)?.expiration_ttl(600).execute().await?;
+            send_telegram_message(&bot_token, chat_id, "Where to save?", Some(choose_keyboard())).await?;
         }
     }
 
