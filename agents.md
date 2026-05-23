@@ -4,7 +4,7 @@
 
 **Pressure Bot Rust** is a serverless Telegram bot running as a **Cloudflare Worker** compiled to **WebAssembly** (`wasm32-unknown-unknown`). It processes incoming Telegram webhooks, parses blood pressure readings or expense inputs from text/photos, and logs them to Google Sheets via the Sheets API.
 
-- **Language**: Rust (edition 2021)
+- **Language**: Rust (edition 2024)
 - **Runtime**: Cloudflare Workers (WebAssembly)
 - **Key Integrations**: Telegram Bot API, Google Sheets API (OAuth2 / JWT), Cloudflare Workers AI (vision models)
 - **State Management**: Cloudflare KV (`STATE_STORE` namespace)
