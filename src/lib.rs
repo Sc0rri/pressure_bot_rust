@@ -1,4 +1,5 @@
 use worker::*;
+use serde::{Deserialize, Serialize};
 
 mod parser;
 mod google;
@@ -12,7 +13,22 @@ use telegram::{Update, TelegramService, CallbackQuery};
 use operations::OperationsService;
 use ai_vision::AiVisionService;
 
-fn get_env_or_secret(env: &Env, name: &str, default: &str) -> String {
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PendingPressure {
+    pub sys: i32,
+    pub dia: i32,
+    pub pulse: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", content = "data")]
+pub enum UserState {
+    None,
+    AwaitingClassification { raw_text: String },
+    AwaitingPressureConfirmation(PendingPressure),
+}
+
+pub(crate) fn get_env_or_secret(env: &Env, name: &str, default: &str) -> String {
     env.secret(name)
         .map(|v| v.to_string())
         .or_else(|_| env.var(name).map(|v| v.to_string()))
@@ -31,7 +47,7 @@ async fn fetch(
         Err(e) => {
             console_log!("Request conversion error: {:?}", e);
             let err_res = Response::error("Bad Request", 400)?;
-            return Ok(err_res.try_into()?);
+            return err_res.try_into();
         }
     };
 
@@ -40,14 +56,14 @@ async fn fetch(
     let method = req.method().to_string();
 
     // Friendly GET landing check to confirm bot status in web browsers
-    if method == "GET" && (path_clean == "/webhook" || path_clean == "") {
+    if method == "GET" && (path_clean == "/webhook" || path_clean.is_empty()) {
         let res = Response::ok("🤖 Pressure Bot is running! Please send POST requests via Telegram webhooks.")?;
-        return Ok(res.try_into()?);
+        return res.try_into();
     }
 
     if method != "POST" || path_clean != "/webhook" {
         let err_res = Response::error("Not Found", 404)?;
-        return Ok(err_res.try_into()?);
+        return err_res.try_into();
     }
 
     // 2. Parse Telegram Update
@@ -61,7 +77,7 @@ async fn fetch(
             console_log!("JSON Parse Error: {:?}, raw: {}", err, update_raw);
             // Always return OK 200 to Telegram so it doesn't keep retrying failed webhook payloads
             let res = Response::empty()?;
-            return Ok(res.try_into()?);
+            return res.try_into();
         }
     };
 
@@ -69,12 +85,12 @@ async fn fetch(
     if allowed_username.is_empty() {
         console_log!("ALLOWED_USERNAME binding is missing!");
         let res = Response::empty()?;
-        return Ok(res.try_into()?);
+        return res.try_into();
     }
 
     // Access control helper
     let check_access = |username: Option<&String>| -> bool {
-        username.and_then(|u| Some(u.as_str())).unwrap_or("") == allowed_username
+        username.map(|u| u.as_str()).unwrap_or("") == allowed_username
     };
 
     // 3. Handle callback_query
@@ -82,7 +98,7 @@ async fn fetch(
         if !check_access(cq.from.username.as_ref()) {
             console_log!("ACCESS DENIED: user '{:?}' is not allowed", cq.from.username);
             let res = Response::empty()?;
-            return Ok(res.try_into()?);
+            return res.try_into();
         }
 
         let env_clone = env.clone();
@@ -93,7 +109,7 @@ async fn fetch(
         });
 
         let res = Response::empty()?;
-        return Ok(res.try_into()?);
+        return res.try_into();
     }
 
     // 4. Handle regular message
@@ -107,7 +123,7 @@ async fn fetch(
         if sender_username != allowed_username {
             console_log!("ACCESS DENIED: user '{}' is not allowed", sender_username);
             let res = Response::empty()?;
-            return Ok(res.try_into()?);
+            return res.try_into();
         }
 
         let chat_id = msg.chat.id;
@@ -123,14 +139,14 @@ async fn fetch(
             });
 
             let res = Response::empty()?;
-            return Ok(res.try_into()?);
+            return res.try_into();
         }
 
         // 4b. Handle text
         let text = msg.text.clone().unwrap_or_default().trim().to_string();
         if text.is_empty() {
             let res = Response::empty()?;
-            return Ok(res.try_into()?);
+            return res.try_into();
         }
 
         console_log!("INPUT TEXT: {}", text);
@@ -146,39 +162,45 @@ async fn fetch(
     }
 
     let res = Response::empty()?;
-    Ok(res.try_into()?)
+    res.try_into()
+}
+
+/// Helper to process regular text flow when there is no pending state or a state is overridden/cancelled
+async fn process_text_flow(
+    env: &Env,
+    token: &str,
+    bot_token: &str,
+    kv: &kv::KvStore,
+    state_key: &str,
+    chat_id: i64,
+    text: &str,
+) -> Result<()> {
+    if let Some(action) = ParserService::detect_action(text) {
+        console_log!("DETECTED: {:?}", action);
+        OperationsService::execute(env, token, bot_token, chat_id, action).await?;
+    } else {
+        console_log!("DETECTED: unknown");
+        // Unknown action: save to KV and offer menu
+        let state = UserState::AwaitingClassification { raw_text: text.to_string() };
+        kv.put(state_key, serde_json::to_value(&state)?)?
+            .expiration_ttl(600)
+            .execute()
+            .await?;
+        TelegramService::send_message(bot_token, chat_id, "Where to save?", Some(TelegramService::choose_keyboard())).await?;
+    }
+    Ok(())
 }
 
 /// Orchestrates the state processing and operations flow in a background task
 async fn handle_webhook_background(env: Env, chat_id: i64, text: String) -> Result<()> {
     let bot_token = env.secret("BOT_TOKEN")?.to_string();
     let kv = env.kv("STATE_STORE")?;
-    let chat_key = chat_id.to_string();
+    let state_key = format!("{}_state", chat_id);
 
-    // 0a. Handle confirm/cancel from confirm_keyboard for pending pressure
-    if text == "✅ Save" {
-        let pending_key = format!("{}_pending_pressure", chat_id);
-        if let Some(pending_str) = kv.get(&pending_key).text().await? {
-            kv.delete(&pending_key).await?;
-            if let Some((sys, dia, pulse)) = ParserService::parse_ai_pressure_response(&pending_str) {
-                let token = GoogleSheetsService::get_token(&env).await?;
-                let action = parser::Action::Pressure { sys, dia, pulse };
-                OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
-            } else {
-                TelegramService::send_message(&bot_token, chat_id, "❌ Could not parse pressure data.", Some(TelegramService::remove_keyboard())).await?;
-            }
-        }
-        return Ok(());
-    }
-
-    if text == "❌ Cancel" {
-        // Cancel pending pressure if exists
-        let pending_pressure_key = format!("{}_pending_pressure", chat_id);
-        kv.delete(&pending_pressure_key).await?;
-        // Also cancel from old choose_keyboard flow
-        if let Some(_) = kv.get(&chat_key).text().await? {
-            kv.delete(&chat_key).await?;
-        }
+    // Cancel from keyboard is universal and handled first
+    if text == telegram::BTN_CANCEL {
+        kv.delete(&state_key).await?;
+        TelegramService::send_message(&bot_token, chat_id, "Cancelled.", Some(TelegramService::remove_keyboard())).await?;
         return Ok(());
     }
 
@@ -192,44 +214,49 @@ async fn handle_webhook_background(env: Env, chat_id: i64, text: String) -> Resu
         }
     };
 
-    // 1. Process Pending Action from KV store
-    if let Some(pending_text) = kv.get(&chat_key).text().await? {
-        match text.as_str() {
-            "🩺 Pressure" => {
-                kv.delete(&chat_key).await?;
-                if let Some(action) = ParserService::parse_manual_pressure(&pending_text) {
+    // Retrieve typed state from KV
+    let state: UserState = kv.get(&state_key).json().await?.unwrap_or(UserState::None);
+
+    match state {
+        UserState::AwaitingPressureConfirmation(pending) => {
+            if text == telegram::BTN_SAVE {
+                kv.delete(&state_key).await?;
+                let action = parser::Action::Pressure {
+                    sys: pending.sys,
+                    dia: pending.dia,
+                    pulse: pending.pulse,
+                };
+                OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
+            } else {
+                // Any other input: discard state and parse this input fresh
+                kv.delete(&state_key).await?;
+                process_text_flow(&env, &token, &bot_token, &kv, &state_key, chat_id, &text).await?;
+            }
+        }
+        UserState::AwaitingClassification { raw_text } => {
+            if text == telegram::BTN_PRESSURE {
+                kv.delete(&state_key).await?;
+                if let Some(action) = ParserService::parse_manual_pressure(&raw_text) {
                     OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
                 } else {
                     TelegramService::send_message(&bot_token, chat_id, "❌ Need at least 2 numbers: sys dia", Some(TelegramService::remove_keyboard())).await?;
                 }
-                return Ok(());
-            }
-            "💸 Cost" => {
-                kv.delete(&chat_key).await?;
-                if let Some(action) = ParserService::parse_manual_cost(&pending_text) {
+            } else if text == telegram::BTN_COST {
+                kv.delete(&state_key).await?;
+                if let Some(action) = ParserService::parse_manual_cost(&raw_text) {
                     OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
                 } else {
                     TelegramService::send_message(&bot_token, chat_id, "❌ Invalid cost format", Some(TelegramService::remove_keyboard())).await?;
                 }
-                return Ok(());
+            } else {
+                // Discard state and process this input fresh
+                kv.delete(&state_key).await?;
+                process_text_flow(&env, &token, &bot_token, &kv, &state_key, chat_id, &text).await?;
             }
-            "❌ Cancel" => {
-                kv.delete(&chat_key).await?;
-                return Ok(());
-            }
-            _ => {}
         }
-    }
-
-    // 2. Default classification flow
-    if let Some(action) = ParserService::detect_action(&text) {
-        console_log!("DETECTED: {:?}", action);
-        OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
-    } else {
-        console_log!("DETECTED: unknown");
-        // Unknown action: save to KV and offer menu
-        kv.put(&chat_key, &text)?.expiration_ttl(600).execute().await?;
-        TelegramService::send_message(&bot_token, chat_id, "Where to save?", Some(TelegramService::choose_keyboard())).await?;
+        UserState::None => {
+            process_text_flow(&env, &token, &bot_token, &kv, &state_key, chat_id, &text).await?;
+        }
     }
 
     Ok(())
@@ -245,24 +272,24 @@ async fn handle_callback_query(env: Env, cq: CallbackQuery) -> Result<()> {
 
     let chat_id = cq.message.as_ref().map(|m| m.chat.id).unwrap_or(0);
     let data = cq.data.unwrap_or_default();
+    let state_key = format!("{}_state", chat_id);
 
     if data == "confirm_pressure" {
-        let chat_key = format!("{}_pending_pressure", chat_id);
-        if let Some(pending_str) = kv.get(&chat_key).text().await? {
-            kv.delete(&chat_key).await?;
-            if let Some((sys, dia, pulse)) = ParserService::parse_ai_pressure_response(&pending_str) {
-                let token = GoogleSheetsService::get_token(&env).await?;
-                let action = parser::Action::Pressure { sys, dia, pulse };
-                OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
-            } else {
-                TelegramService::send_message(&bot_token, chat_id, "❌ Could not parse pressure data. Please enter manually.", Some(TelegramService::remove_keyboard())).await?;
-            }
+        if let Some(UserState::AwaitingPressureConfirmation(pending)) = kv.get(&state_key).json().await? {
+            kv.delete(&state_key).await?;
+            let token = GoogleSheetsService::get_token(&env).await?;
+            let action = parser::Action::Pressure {
+                sys: pending.sys,
+                dia: pending.dia,
+                pulse: pending.pulse,
+            };
+            OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
         } else {
             TelegramService::send_message(&bot_token, chat_id, "❌ No pending pressure data found.", Some(TelegramService::remove_keyboard())).await?;
         }
     } else if data == "cancel_pressure" {
-        let chat_key = format!("{}_pending_pressure", chat_id);
-        kv.delete(&chat_key).await?;
+        kv.delete(&state_key).await?;
+        TelegramService::send_message(&bot_token, chat_id, "Cancelled.", Some(TelegramService::remove_keyboard())).await?;
     }
 
     Ok(())
@@ -272,16 +299,11 @@ async fn handle_callback_query(env: Env, cq: CallbackQuery) -> Result<()> {
 async fn handle_photo(env: Env, chat_id: i64, msg: telegram::Message) -> Result<()> {
     let bot_token = env.secret("BOT_TOKEN")?.to_string();
     let kv = env.kv("STATE_STORE")?;
+    let state_key = format!("{}_state", chat_id);
 
-    // 1. Get the best photo for OCR - second from last (medium resolution) for better AI recognition
+    // 1. Get the highest resolution photo for precise OCR of thin 7-segment display digits
     let photos = msg.photo.unwrap_or_default();
-    let photo = if photos.len() >= 3 {
-        // Use medium resolution (second to last) - AI works better with ~450px width
-        &photos[photos.len() - 2]
-    } else {
-        // Fallback to the largest if only 1-2 photos available
-        photos.last().ok_or_else(|| worker::Error::from("No photos found"))?
-    };
+    let photo = photos.last().ok_or_else(|| worker::Error::from("No photos found"))?;
 
     console_log!("Processing photo: file_id={} size={:?}", photo.file_id, photo.file_size);
 
@@ -309,13 +331,9 @@ async fn handle_photo(env: Env, chat_id: i64, msg: telegram::Message) -> Result<
         }
         msg.push_str("\n\nSave?");
 
-        // Save pending pressure to KV with key {chat_id}_pending_pressure
-        let kv_value = format!("{} {} {}",
-            sys,
-            dia,
-            pulse.map(|p| p.to_string()).unwrap_or_default()
-        );
-        kv.put(&format!("{}_pending_pressure", chat_id), &kv_value)?
+        // Save pending pressure state as UserState
+        let state = UserState::AwaitingPressureConfirmation(PendingPressure { sys, dia, pulse });
+        kv.put(&state_key, serde_json::to_value(&state)?)?
             .expiration_ttl(600)
             .execute()
             .await?;

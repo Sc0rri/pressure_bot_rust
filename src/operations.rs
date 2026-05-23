@@ -2,14 +2,7 @@ use worker::*;
 use crate::google::GoogleSheetsService;
 use crate::telegram::TelegramService;
 use crate::parser::Action;
-
-// Helper to resiliently read Env
-fn get_env_or_secret(env: &Env, name: &str, default: &str) -> String {
-    env.secret(name)
-        .map(|v| v.to_string())
-        .or_else(|_| env.var(name).map(|v| v.to_string()))
-        .unwrap_or_else(|_| default.to_string())
-}
+use crate::get_env_or_secret;
 
 pub struct OperationsService;
 
@@ -64,6 +57,7 @@ impl OperationsService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn add_pressure(
         token: &str,
         sheet_id: &str,

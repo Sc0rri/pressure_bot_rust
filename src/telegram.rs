@@ -1,6 +1,11 @@
 use worker::*;
 use serde::{Deserialize, Serialize};
 
+pub const BTN_SAVE: &str = "✅ Save";
+pub const BTN_CANCEL: &str = "❌ Cancel";
+pub const BTN_PRESSURE: &str = "🩺 Pressure";
+pub const BTN_COST: &str = "💸 Cost";
+
 // Telegram Update models
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Update {
@@ -92,14 +97,13 @@ impl TelegramService {
         Ok(())
     }
 
-    /// Keyboard with options for ambiguous entries
     pub fn choose_keyboard() -> serde_json::Value {
         serde_json::json!({
             "keyboard": [
                 [
-                    {"text": "🩺 Pressure"},
-                    {"text": "💸 Cost"},
-                    {"text": "❌ Cancel"}
+                    {"text": BTN_PRESSURE},
+                    {"text": BTN_COST},
+                    {"text": BTN_CANCEL}
                 ]
             ],
             "one_time_keyboard": true,
@@ -114,13 +118,12 @@ impl TelegramService {
         })
     }
 
-    /// Keyboard for confirming or cancelling a pending action
     pub fn confirm_keyboard() -> serde_json::Value {
         serde_json::json!({
             "keyboard": [
                 [
-                    {"text": "✅ Save"},
-                    {"text": "❌ Cancel"}
+                    {"text": BTN_SAVE},
+                    {"text": BTN_CANCEL}
                 ]
             ],
             "one_time_keyboard": true,

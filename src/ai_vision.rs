@@ -1,4 +1,5 @@
 use worker::*;
+use crate::get_env_or_secret;
 
 /// Default vision model for better text recognition on images.
 /// Can be overridden via env var AI_VISION_MODEL.
@@ -53,7 +54,7 @@ impl AiVisionService {
                         "content": [
                             {
                                 "type": "text",
-                                "text": "You are an OCR assistant. Read digits ONLY from this blood pressure monitor display. Look carefully at each digit individually. The display shows systolic (top/left, 80-250) and diastolic (bottom/right, 40-150) numbers. A pulse number (40-200, labeled PULSE/HR) may be nearby. Return ONLY the numbers with spaces: SYSTOLIC DIASTOLIC PULSE. Make sure you read each digit correctly - do not confuse 5 and 8, or 0 and 8, or 1 and 7. Examples: '130 85 72' or '120 80' or '158 95 65'. Read each digit character by character. If you see 158, return 158 not 150."
+                                "text": "You are an expert OCR assistant specialized in medical displays. Read digits ONLY from this blood pressure monitor screen.\nThe screen has a clear vertical layout with three distinct rows:\n1. TOP ROW (labeled 'SYS mmHg'): Systolic blood pressure (typically 80-250).\n2. MIDDLE ROW (labeled 'DIA mmHg'): Diastolic blood pressure (typically 40-150).\n3. BOTTOM ROW (labeled 'PULSE /min'): Pulse rate (typically 40-200).\n\nLook at the image carefully:\n- First, locate the TOP row digits. Be extremely careful with digit segments: do not confuse '7' with '0' or '1'. If a digit has a top horizontal bar and a slanted right leg, it is a '7' (not a '1' or '0').\n- Second, locate the MIDDLE row digits (Diastolic). Do not confuse it with the bottom row!\n- Third, locate the BOTTOM row digits (Pulse).\n\nReturn ONLY the numbers separated by spaces in this exact order: SYSTOLIC DIASTOLIC PULSE.\nExample output format: \"135 85 72\" or \"120 80 65\". Do not add any other words, prefixes, or symbols."
                             },
                             {
                                 "type": "image_url",
@@ -69,7 +70,7 @@ impl AiVisionService {
         } else {
             let image_array: Vec<u8> = image_bytes.to_vec();
             serde_json::json!({
-                "prompt": "Look at this blood pressure monitor display. Find systolic (80-250), diastolic (40-150), and pulse (40-200) if visible. Return ONLY numbers separated by spaces like '130 85 72' or '120 80'. No slash, no text, just numbers.",
+                "prompt": "Look at this vertical blood pressure monitor screen. Read the three numbers from top to bottom:\n1. Top row (SYS): Systolic pressure (80-250).\n2. Middle row (DIA): Diastolic pressure (40-150).\n3. Bottom row (PULSE): Pulse rate (40-200).\n\nBe extremely precise reading each digit. Pay close attention to 7-segment digit lines so you don't confuse '7' with '0' or '1'.\nReturn ONLY the three numbers separated by spaces like '135 85 72'. Do not write any text, prefixes, or slashes.",
                 "image": image_array
             })
         };
@@ -120,11 +121,4 @@ impl AiVisionService {
         console_log!("AI description: {}", ai_text);
         Ok(ai_text)
     }
-}
-
-fn get_env_or_secret(env: &Env, name: &str, default: &str) -> String {
-    env.secret(name)
-        .map(|v| v.to_string())
-        .or_else(|_| env.var(name).map(|v| v.to_string()))
-        .unwrap_or_else(|_| default.to_string())
 }
