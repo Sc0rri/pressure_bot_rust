@@ -3,85 +3,81 @@
 This is the **Rust (WebAssembly)** serverless version of **`pressure_bot`**, designed to be hosted as a **Cloudflare Worker** on their **Free Tier** ($0/month).
 
 It processes incoming Telegram webhooks, parses blood pressure or expense inputs, recognizes blood pressure from photos using **Cloudflare Workers AI (llava-1.5-7b-hf / Llama 3.2 Vision)**, and securely logs them to your Google Sheets using OAuth2 credentials—all with **~0ms cold starts** and highly optimized **KV-caching** for access tokens.
-
----
-
 ## ⚡ Features & Enhancements in Rust
 
-1.  **📸 AI Photo Recognition:** Send a photo of your blood pressure monitor — the bot automatically extracts systolic, diastolic, and pulse using **Cloudflare Workers AI** (`@cf/llava-hf/llava-1.5-7b-hf` or `@cf/meta/llama-3.2-11b-vision-instruct`).
-2.  **💾 Serverless State Management:** Replaces the Go in-memory map with **Cloudflare KV**, making the entire bot completely stateless and scalable.
-3.  **🛡️ Low CPU Footprint OAuth2 Caching:** Google Sheets API OAuth tokens are cached in Cloudflare KV with a 55-minute expiration. This drops average request CPU times down to **< 5ms** and ensures you stay safely under the free tier execution limits.
-4.  **📦 Zero Heavy Crypto Bloat:** Uses the pure-Rust `jwt-simple` crate for fast Wasm-compatible RS256 token signing.
-5.  **⏱️ Embedded Timezone Support:** Statically embeds timezone databases using Wasm-compatible `chrono-tz`, preserving your precise local logging times (e.g. `Europe/Kiev`).
-6.  **🌐 Cyrillic Sheets & Custom Range Encoding:** Implements native percent-encoding and automatic single-quote range escaping, handling Cyrillic tab names with spaces and parentheses (like `'Значения (2026 )'!A3`) perfectly.
-7.  **📢 Direct Telegram Error Reporting:** Instantly forwards Google Sheets API errors directly to your Telegram chat to prevent silent failures.
-8.  **⌨️ Automatic Keyboard Management:** Seamlessly collapses and hides the Telegram custom keyboard when operations are completed or canceled.
+1.  **📸 Advanced AI Photo OCR:** Sends high-resolution images (`photos.last()`) of your blood pressure monitor directly to **Cloudflare Workers AI** (`@cf/meta/llama-3.2-11b-vision-instruct`). The vision prompt is heavily optimized with explicit vertical Omron layout rules, 7-segment digit legibility parsing, and vertical level-indicator and decimal point exclusion rules to achieve pristine recognition accuracy.
+2.  **💾 Strongly-Typed State Machine:** Implements a type-safe, robust finite state machine (`UserState`) serialized as a JSON string in KV. This eliminates race conditions, session desynchronization, and fragmented keys.
+3.  **⌨️ Centralized UI Button Labels:** Button labels (`✅ Save`, `❌ Cancel`, `🩺 Pressure`, `💸 Cost`) are centralized as public constants in `src/telegram.rs`, making the matching pipeline entirely typo-safe.
+4.  **🛡️ Low CPU Footprint OAuth2 Caching:** Google Sheets API OAuth tokens are cached in Cloudflare KV with a 55-minute expiration. This drops average request CPU times down to **< 5ms** and ensures you stay safely under the free tier execution limits.
+5.  **📦 Zero Heavy Crypto Bloat:** Uses the pure-Rust `jwt-simple` crate for fast Wasm-compatible RS256 token signing.
+6.  **⏱️ Embedded Timezone Support:** Statically embeds timezone databases using Wasm-compatible `chrono-tz`, preserving your precise local logging times (e.g. `Europe/Kiev`).
+7.  **🌐 Cyrillic Sheets & Custom Range Encoding:** Implements native percent-encoding and automatic single-quote range escaping, handling Cyrillic tab names with spaces and parentheses (like `'Значения (2026 )'!A3`) perfectly.
+8.  **📢 Direct Telegram Error Reporting:** Instantly forwards Google Sheets API errors directly to your Telegram chat to prevent silent failures.
+9.  **⌨️ Automatic Keyboard Management:** Seamlessly collapses and hides the Telegram custom keyboard when operations are completed or canceled without spamming "Cancelled" messages.
 
 ---
 
 ## 🧠 Operation Logic & Message Processing Flow
 
-The bot runs a completely stateless, deterministic decision pipeline for every incoming message. Below is the exact step-by-step logic:
+The bot runs a completely stateless, deterministic decision pipeline for every incoming message. Below is the exact step-by-step logic representing our `UserState` machine:
 
 ```mermaid
-graph TD
-    A[Incoming Message] --> B{Access Control: Username Allowed?}
-    B -- No --> C[Silent Drop]
-    B -- Yes --> D{Has Photo?}
+stateDiagram-v2
+    [*] --> RetrieveState
+    RetrieveState --> ProcessInput : Load UserState from KV
     
-    D -- Yes --> E1[Download photo from Telegram]
-    E1 --> E2[Send to Workers AI for OCR]
-    E2 --> E3{Recognized pressure?}
-    E3 -- Yes --> E4[Show result with ✅ Save / ❌ Cancel keyboard]
-    E3 -- No --> E5[Show error message]
+    state ProcessInput {
+        state "AwaitingPressureConfirmation(pending)" as APC
+        state "AwaitingClassification { raw_text }" as AC
+        state "UserState::None" as NoneState
+        
+        [*] --> CheckState
+        CheckState --> APC : State Awaiting Confirmation
+        CheckState --> AC : State Awaiting Classification
+        CheckState --> NoneState : No Pending State
+        
+        APC --> SavePressure : text == "✅ Save"
+        APC --> DiscardAndProcessAPC : text != "✅ Save" (Fallback to NoneState)
+        
+        AC --> SaveForcedPressure : text == "🩺 Pressure"
+        AC --> SaveForcedCost : text == "💸 Cost"
+        AC --> DiscardAndProcessAC : text is other input (Fallback to NoneState)
+        
+        NoneState --> ExecuteAction : ParserService::detect_action(text) matches
+        NoneState --> AskUser : No match (unknown action)
+        
+        AskUser --> [*] : Save AwaitingClassification state to KV & show keyboard
+        SavePressure --> [*] : Execute add_pressure & clear KV
+        SaveForcedPressure --> [*] : Execute add_pressure & clear KV
+        SaveForcedCost --> [*] : Execute add_cost & clear KV
+    }
     
-    D -- No --> F{Pending Action in KV?}
-    
-    F -- Yes --> G{Matches Confirm Buttons?}
-    G -- ✅ Save --> G1[Parse AI pressure from KV & Save to Sheets]
-    G -- ❌ Cancel --> G2[Delete pending KV state]
-    G -- 🩺 Pressure --> H1[Parse pending text as Pressure & Save]
-    G -- 💸 Cost --> H2[Parse pending text as Cost & Save]
-    G -- No (other text) --> I[Proceed to Classification]
-    
-    F -- No --> I
-    
-    I --> J{Classifier detect_type}
-    J -- "Pressure (2-3 nums)" --> K[Save to Pressure Sheet]
-    J -- "Cost (1 num + optional text)" --> L[Save to Costs Sheet]
-    J -- "Ambiguous / Multi-num" --> M[Save text in KV for 10 min & Send confirm keyboard]
-
-    G1 --> N[Clear KV State & Auto-collapse keyboard]
-    G2 --> N
-    H1 --> N
-    H2 --> N
-    K --> N
-    L --> N
+    ProcessInput --> UniversalCancel : text == "❌ Cancel"
+    UniversalCancel --> [*] : Clear state in KV silently
 ```
 
 ### 1. Photo Recognition Flow
 When a user sends a photo:
-- The bot downloads the largest photo variant from Telegram servers
-- Encodes it and sends to **Cloudflare Workers AI** with a specialized prompt for blood pressure extraction
-- Parses the AI response to extract **systolic**, **diastolic**, and optionally **pulse** values
-- Shows the recognized values with **✅ Save** / **❌ Cancel** keyboard buttons
-- On ✅ Save: saves to Google Sheets Pressure tab
-- On ❌ Cancel: removes pending data from KV store
+- The bot downloads the highest resolution photo (`photos.last()`) from Telegram servers.
+- Sends it to **Cloudflare Workers AI** with an optimized prompt for Omron 7-segment vertical layout extraction.
+- Parses the AI response to extract **systolic**, **diastolic**, and optionally **pulse** values.
+- Saves the state as `UserState::AwaitingPressureConfirmation` in KV and offers a **✅ Save** / **❌ Cancel** keyboard.
+- On **✅ Save**: saves to Google Sheets Pressure tab.
 
 ### 2. Security & Access Check
 Every request received at `/webhook` is authenticated. The bot verifies that the message sender's Telegram username matches the secure `ALLOWED_USERNAME` secret. Unauthorized messages are discarded instantly.
 
-### 3. Session Lookup (Cloudflare KV)
-The bot checks Cloudflare KV under the sender's `chat_id` key for any previously stored ambiguous messages:
-*   If a pending text exists and the user clicked **🩺 Pressure** or **💸 Cost**, the bot executes the respective action on the *stored pending text*, clears the KV state, and collapses the reply keyboard.
-*   If the user clicked **❌ Cancel**, the KV state is cleared, and the keyboard is collapsed.
-*   If the user sends any other message, it falls through to new input classification.
+### 3. Session Lookup & State Transitions
+The bot retrieves the active `UserState` from Cloudflare KV under `{chat_id}_state` and performs type-safe transitions:
+*   **`UserState::AwaitingPressureConfirmation(pending)`**: If the user confirms with `✅ Save`, the data is written to Google Sheets. Any other message immediately discards this state and parses the text fresh.
+*   **`UserState::AwaitingClassification { raw_text }`**: If the user selects `🩺 Pressure` or `💸 Cost`, the bot parses the *original raw text* and logs it to the corresponding tab. Any other message discards this state and processes the new text.
+*   **`UserState::None`**: Performs automatic text classification.
 
-### 4. Smart Classifier (`detect_type`)
+### 4. Smart Classifier (`detect_action`)
 If there is no pending session (or if the input fell through), the text is processed by a highly optimized parser:
 *   **🩺 Blood Pressure:** Matches if the text contains exactly **2 or 3 numbers** separated by spaces, slashes, or vertical bars (e.g., `120 80`, `130/80/70`), where numbers fit biological boundaries (systolic 80-250, diastolic 40-150, pulse 40-200). Logged to the **Pressure** tab with a timestamp.
 *   **💸 Expense / Cost:** Matches if the text contains exactly **1 number** and optional text comments (e.g., `250 taxi`, `500`). Logged to the **Costs** tab with a date.
-*   **❓ Ambiguous:** If the input doesn't fit either pattern (e.g., multiple numbers with text), the bot stores the raw input text in KV (with a 10-minute expiration TTL) and responds with a selection keyboard asking: *"Where to save?"*.
+*   **❓ Ambiguous:** If the input doesn't fit either pattern (e.g., multiple numbers with text), the bot stores the raw input text in KV as `UserState::AwaitingClassification` (with a 10-minute expiration TTL) and responds with a selection keyboard asking: *"Where to save?"*.
 
 ---
 
