@@ -164,7 +164,6 @@ async fn handle_webhook_background(env: Env, chat_id: i64, text: String) -> Resu
                 let token = GoogleSheetsService::get_token(&env).await?;
                 let action = parser::Action::Pressure { sys, dia, pulse };
                 OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
-                TelegramService::send_message(&bot_token, chat_id, "✅ Pressure saved from photo!", Some(TelegramService::remove_keyboard())).await?;
             } else {
                 TelegramService::send_message(&bot_token, chat_id, "❌ Could not parse pressure data.", Some(TelegramService::remove_keyboard())).await?;
             }
@@ -180,7 +179,6 @@ async fn handle_webhook_background(env: Env, chat_id: i64, text: String) -> Resu
         if let Some(_) = kv.get(&chat_key).text().await? {
             kv.delete(&chat_key).await?;
         }
-        TelegramService::send_message(&bot_token, chat_id, "❌ Canceled", Some(TelegramService::remove_keyboard())).await?;
         return Ok(());
     }
 
@@ -217,7 +215,6 @@ async fn handle_webhook_background(env: Env, chat_id: i64, text: String) -> Resu
             }
             "❌ Cancel" => {
                 kv.delete(&chat_key).await?;
-                TelegramService::send_message(&bot_token, chat_id, "❌ Canceled", Some(TelegramService::remove_keyboard())).await?;
                 return Ok(());
             }
             _ => {}
@@ -257,7 +254,6 @@ async fn handle_callback_query(env: Env, cq: CallbackQuery) -> Result<()> {
                 let token = GoogleSheetsService::get_token(&env).await?;
                 let action = parser::Action::Pressure { sys, dia, pulse };
                 OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
-                TelegramService::send_message(&bot_token, chat_id, "✅ Pressure saved from photo!", Some(TelegramService::remove_keyboard())).await?;
             } else {
                 TelegramService::send_message(&bot_token, chat_id, "❌ Could not parse pressure data. Please enter manually.", Some(TelegramService::remove_keyboard())).await?;
             }
@@ -267,7 +263,6 @@ async fn handle_callback_query(env: Env, cq: CallbackQuery) -> Result<()> {
     } else if data == "cancel_pressure" {
         let chat_key = format!("{}_pending_pressure", chat_id);
         kv.delete(&chat_key).await?;
-        TelegramService::send_message(&bot_token, chat_id, "❌ Canceled", Some(TelegramService::remove_keyboard())).await?;
     }
 
     Ok(())
