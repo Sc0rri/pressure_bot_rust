@@ -1,5 +1,6 @@
 target/
 build/
+.antigravitycli/
 .wrangler/
 .dev.vars
 .dev.vars.local

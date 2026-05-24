@@ -8,3 +8,9 @@ command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
 [[kv_namespaces]]
 binding = "STATE_STORE"
 id = "9ca274fd5d074a63adc1e405ba90d065"
+
+[ai]
+binding = "AI"
+
+[observability]
+enabled = false
