@@ -97,6 +97,37 @@ impl TelegramService {
         Ok(())
     }
 
+    /// Sends a message with an inline keyboard markup (not a reply keyboard)
+    pub async fn send_inline_message(
+        bot_token: &str,
+        chat_id: i64,
+        text: &str,
+        inline_markup: serde_json::Value,
+    ) -> Result<()> {
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": inline_markup,
+        });
+
+        let headers = Headers::new();
+        headers.set("Content-Type", "application/json")?;
+
+        let mut req_init = RequestInit::new();
+        req_init.with_method(Method::Post);
+        req_init.with_headers(headers);
+        req_init.with_body(Some(serde_json::to_string(&payload)?.into()));
+
+        let req = Request::new_with_init(&url, &req_init)?;
+        let mut resp = Fetch::Request(req).send().await?;
+        if resp.status_code() != 200 {
+            let err_text = resp.text().await?;
+            console_log!("Telegram Inline Send Error: {}", err_text);
+        }
+        Ok(())
+    }
+
     pub fn choose_keyboard() -> serde_json::Value {
         serde_json::json!({
             "keyboard": [
@@ -128,6 +159,35 @@ impl TelegramService {
             ],
             "one_time_keyboard": true,
             "resize_keyboard": true
+        })
+    }
+
+    /// Generates an inline keyboard for choosing between multiple pressure options.
+    /// Each option gets a button, plus a final Cancel button.
+    pub fn choice_keyboard(options_count: usize) -> serde_json::Value {
+        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+
+        for i in 0..options_count {
+            let label = format!("Вариант {}", i + 1);
+            let data = format!("select_option_{}", i);
+            rows.push(vec![
+                serde_json::json!({
+                    "text": label,
+                    "callback_data": data
+                })
+            ]);
+        }
+
+        // Cancel button
+        rows.push(vec![
+            serde_json::json!({
+                "text": BTN_CANCEL,
+                "callback_data": "cancel_option"
+            })
+        ]);
+
+        serde_json::json!({
+            "inline_keyboard": rows
         })
     }
 

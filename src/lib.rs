@@ -26,6 +26,7 @@ pub enum UserState {
     None,
     AwaitingClassification { raw_text: String },
     AwaitingPressureConfirmation(PendingPressure),
+    AwaitingMultipleChoice { options: Vec<PendingPressure> },
 }
 
 pub(crate) fn get_env_or_secret(env: &Env, name: &str, default: &str) -> String {
@@ -272,6 +273,13 @@ async fn handle_webhook_background(env: Env, chat_id: i64, text: String) -> Resu
         UserState::None => {
             process_text_flow(&env, &token, &bot_token, &kv, &state_key, chat_id, &text).await?;
         }
+        // AwaitingMultipleChoice is handled via callback_query (inline buttons), not text input.
+        // If user types text, discard state and process fresh.
+        UserState::AwaitingMultipleChoice { .. } => {
+            console_log!("Text input while awaiting multiple choice, discarding state.");
+            kv.delete(&state_key).await?;
+            process_text_flow(&env, &token, &bot_token, &kv, &state_key, chat_id, &text).await?;
+        }
     }
 
     Ok(())
@@ -313,8 +321,31 @@ async fn handle_callback_query(env: Env, cq: CallbackQuery) -> Result<()> {
         } else {
             TelegramService::send_message(&bot_token, chat_id, "❌ No pending pressure data found.", Some(TelegramService::remove_keyboard())).await?;
         }
-    } else if data == "cancel_pressure" {
+    } else if data == "cancel_pressure" || data == "cancel_option" {
         kv.delete(&state_key).await?;
+        TelegramService::send_message(&bot_token, chat_id, "❌ Cancelled.", Some(TelegramService::remove_keyboard())).await?;
+    } else if let Some(option_index) = data.strip_prefix("select_option_") {
+        // Handle selection of a specific option from multiple choice
+        if let UserState::AwaitingMultipleChoice { options } = state {
+            if let Ok(index) = option_index.parse::<usize>() {
+                if let Some(pending) = options.get(index) {
+                    kv.delete(&state_key).await?;
+                    let token = GoogleSheetsService::get_token(&env).await?;
+                    let action = parser::Action::Pressure {
+                        sys: pending.sys,
+                        dia: pending.dia,
+                        pulse: pending.pulse,
+                    };
+                    OperationsService::execute(&env, &token, &bot_token, chat_id, action).await?;
+                } else {
+                    TelegramService::send_message(&bot_token, chat_id, "❌ Invalid option selected.", Some(TelegramService::remove_keyboard())).await?;
+                }
+            } else {
+                TelegramService::send_message(&bot_token, chat_id, "❌ Invalid option format.", Some(TelegramService::remove_keyboard())).await?;
+            }
+        } else {
+            TelegramService::send_message(&bot_token, chat_id, "❌ No multiple choice data found.", Some(TelegramService::remove_keyboard())).await?;
+        }
     }
 
     Ok(())
@@ -340,8 +371,8 @@ async fn handle_photo(env: Env, chat_id: i64, msg: telegram::Message) -> Result<
 
     console_log!("Downloaded photo: {} bytes", image_bytes.len());
 
-    // 3. Call Workers AI via AiVisionService
-    let ai_text = match AiVisionService::recognize_pressure(&env, &image_bytes).await {
+    // 3. Call Workers AI via AiVisionService in batch mode (multiple parallel attempts)
+    let ai_responses = match AiVisionService::recognize_pressure_batch(&env, &image_bytes).await {
         Ok(t) => t,
         Err(e) => {
             console_log!("AI recognition error: {:?}", e);
@@ -350,30 +381,76 @@ async fn handle_photo(env: Env, chat_id: i64, msg: telegram::Message) -> Result<
         }
     };
 
-    // 4. Parse pressure from AI response
-    if let Some((sys, dia, pulse)) = ParserService::parse_ai_pressure_response(&ai_text) {
-        let mut msg = format!("📊 Recognized: {}/{}", sys, dia);
-        if let Some(p) = pulse {
-            msg.push_str(&format!(" pulse {}", p));
+    // 4. Parse all responses, collect unique valid results
+    let mut unique_options: Vec<PendingPressure> = Vec::new();
+    for response_text in &ai_responses {
+        if let Some((sys, dia, pulse)) = ParserService::parse_ai_pressure_response(response_text) {
+            let pending = PendingPressure { sys, dia, pulse };
+            if !unique_options.contains(&pending) {
+                unique_options.push(pending);
+            }
         }
-        msg.push_str("\n\nSave?");
+    }
 
-        // Save pending pressure state as UserState
-        let state = UserState::AwaitingPressureConfirmation(PendingPressure { sys, dia, pulse });
-        let state_json = serde_json::to_string(&state)?;
-        console_log!("Saving pending pressure state: key={}, val={}", state_key, state_json);
-        kv.put(&state_key, &state_json)?
-            .expiration_ttl(600)
-            .execute()
-            .await?;
+    console_log!("AI recognition: {} unique valid options out of {} responses", unique_options.len(), ai_responses.len());
 
-        TelegramService::send_message(&bot_token, chat_id, &msg, Some(TelegramService::confirm_keyboard())).await?;
-    } else {
-        console_log!("Could not parse pressure from AI response: {}", ai_text);
-        TelegramService::send_message(&bot_token, chat_id,
-            &format!("❌ Could not recognize pressure numbers in image.\nAI said: {}\n\nPlease enter pressure manually.", ai_text),
-            Some(TelegramService::remove_keyboard()),
-        ).await?;
+    // 5. Handle based on number of unique options
+    match unique_options.len() {
+        0 => {
+            // No valid options - show error with the first AI response text for debugging
+            let first_response = ai_responses.first().map(|s| s.as_str()).unwrap_or("(empty)");
+            TelegramService::send_message(&bot_token, chat_id,
+                &format!("❌ Could not recognize pressure numbers in image.\nAI said: {}\n\nPlease enter pressure manually.", first_response),
+                Some(TelegramService::remove_keyboard()),
+            ).await?;
+        }
+        1 => {
+            // Single option - ask for confirmation as before
+            let pending = &unique_options[0];
+            let mut msg = format!("📊 Recognized: {}/{}", pending.sys, pending.dia);
+            if let Some(p) = pending.pulse {
+                msg.push_str(&format!(" pulse {}", p));
+            }
+            msg.push_str("\n\nSave?");
+
+            // Save pending pressure state
+            let state = UserState::AwaitingPressureConfirmation(pending.clone());
+            let state_json = serde_json::to_string(&state)?;
+            console_log!("Saving pending pressure state: key={}, val={}", state_key, state_json);
+            kv.put(&state_key, &state_json)?
+                .expiration_ttl(600)
+                .execute()
+                .await?;
+
+            TelegramService::send_message(&bot_token, chat_id, &msg, Some(TelegramService::confirm_keyboard())).await?;
+        }
+        _ => {
+            // Multiple options - show choice inline keyboard
+            let mut msg_parts: Vec<String> = Vec::new();
+            msg_parts.push("📊 Multiple options found:".to_string());
+            for (i, opt) in unique_options.iter().enumerate() {
+                let mut opt_str = format!("{}️⃣  {}/{}", i + 1, opt.sys, opt.dia);
+                if let Some(p) = opt.pulse {
+                    opt_str.push_str(&format!(" pulse {}", p));
+                }
+                msg_parts.push(opt_str);
+            }
+            msg_parts.push("\nChoose the correct one:".to_string());
+            let msg = msg_parts.join("\n");
+
+            // Save multiple choice state
+            let state = UserState::AwaitingMultipleChoice { options: unique_options.clone() };
+            let state_json = serde_json::to_string(&state)?;
+            console_log!("Saving multiple choice state: key={}, val={}", state_key, state_json);
+            kv.put(&state_key, &state_json)?
+                .expiration_ttl(600)
+                .execute()
+                .await?;
+
+            // Send with inline keyboard
+            let inline_kb = TelegramService::choice_keyboard(unique_options.len());
+            TelegramService::send_inline_message(&bot_token, chat_id, &msg, inline_kb).await?;
+        }
     }
 
     Ok(())

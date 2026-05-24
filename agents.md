@@ -16,8 +16,8 @@
 src/
 ├── lib.rs          # Entry point: HTTP handler, state machine orchestration, routing
 ├── telegram.rs     # Telegram API types (Update, Message, CallbackQuery, PhotoSize) & TelegramService
-├── parser.rs       # Text classification: Action enum (Pressure | Cost), detect_action, AI response parsing
-├── ai_vision.rs    # AiVisionService: sends photos to Cloudflare Workers AI for OCR
+├── parser.rs       # Text classification: Action enum (Pressure | Cost), detect_action, AI response parsing (JSON + fallback)
+├── ai_vision.rs    # AiVisionService: batch parallel photo recognition via Cloudflare Workers AI
 ├── operations.rs   # OperationsService: dispatches Actions → Google Sheets writes + Telegram notifications
 └── google.rs       # GoogleSheetsService: JWT-based OAuth2 token generation, KV caching, Sheets HTTP client
 ```
@@ -27,11 +27,12 @@ src/
 ```
 Telegram Webhook POST /webhook
   → lib.rs: parse Update → access control (ALLOWED_USERNAME)
-  → Photo? → ai_vision.rs (Workers AI OCR) → parser.rs (parse_ai_pressure_response)
+  → Photo? → ai_vision.rs (Workers AI OCR, N parallel attempts) → parser.rs (parse_ai_pressure_response: JSON first, then fallback)
   → Text?  → KV state lookup → state machine transition:
       • AwaitingPressureConfirmation → Save or re-parse
-      • AwaitingClassification       → Force Pressure/Cost or re-parse
-      • None                         → parser::detect_action(text)
+      • AwaitingMultipleChoice      → Inline button selection (select_option_N / cancel_option)
+      • AwaitingClassification      → Force Pressure/Cost or re-parse
+      • None                        → parser::detect_action(text)
   → operations.rs → google.rs → Google Sheets API
   → telegram.rs → send confirmation/error to user
 ```
@@ -40,13 +41,25 @@ Telegram Webhook POST /webhook
 
 The bot implements a **type-safe finite state machine** serialized as tagged JSON in KV under key `{chat_id}_state`:
 
-| State                               | Trigger to Enter                  | Transitions Out                            |
-|--------------------------------------|-----------------------------------|--------------------------------------------|
-| `None`                               | Default / after save or cancel    | → detect_action → save or → AwaitingClassification |
-| `AwaitingClassification { raw_text }` | Ambiguous input                   | `🩺 Pressure` / `💸 Cost` / new input / `❌ Cancel` |
-| `AwaitingPressureConfirmation(data)` | AI photo recognition succeeded    | `✅ Save` / new input / `❌ Cancel`         |
+| State                                | Trigger to Enter                  | Transitions Out                             |
+|--------------------------------------|-----------------------------------|---------------------------------------------|
+| `None`                                | Default / after save or cancel    | → detect_action → save or → AwaitingClassification |
+| `AwaitingClassification { raw_text }`  | Ambiguous input                   | `🩺 Pressure` / `💸 Cost` / new input / `❌ Cancel` |
+| `AwaitingPressureConfirmation(data)`  | AI photo recognition (1 unique)   | `✅ Save` / new input / `❌ Cancel`          |
+| `AwaitingMultipleChoice { options }`  | AI photo recognition (2+ unique)  | Inline button `select_option_N` / text discard / `cancel_option` |
 
 All KV state entries have a **10-minute TTL** (`expiration_ttl(600)`).
+
+### Photo Recognition Flow (Multi-Attempt Optimization)
+
+1. Download highest resolution photo from Telegram
+2. Send **N parallel requests** (default 4, configurable via `AI_VISION_RETRIES` env) to Workers AI
+3. Each request uses JSON-structured prompt requiring `{"sys": 135, "dia": 85, "pulse": 72}` output
+4. Parse each response via `parse_ai_pressure_response()` (JSON first, then numeric fallback)
+5. Collect unique valid `PendingPressure` readings
+6. 0 readings → error message
+7. 1 reading → `AwaitingPressureConfirmation` with Save/Cancel keyboard
+8. 2+ readings → `AwaitingMultipleChoice` with inline buttons for selection
 
 ## Coding Conventions
 
@@ -61,7 +74,7 @@ All KV state entries have a **10-minute TTL** (`expiration_ttl(600)`).
 ### Environment & Secrets
 Access configuration through the `Env` object:
 - **Secrets** (via Wrangler CLI): `BOT_TOKEN`, `ALLOWED_USERNAME`, `SHEET_ID`, `GOOGLE_CREDENTIALS_JSON`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`
-- **Optional secrets**: `PRESSURE_SHEET`, `PRESSURE_SHEET_ID`, `COSTS_SHEET`, `COSTS_SHEET_ID`, `TIMEZONE`, `AI_VISION_MODEL`
+- **Optional secrets**: `PRESSURE_SHEET`, `PRESSURE_SHEET_ID`, `COSTS_SHEET`, `COSTS_SHEET_ID`, `TIMEZONE`, `AI_VISION_MODEL`, `AI_VISION_RETRIES`
 - Use `get_env_or_secret(env, name, default)` helper to read with fallback defaults.
 - **Never hardcode secrets** in source code.
 
@@ -70,12 +83,25 @@ Access configuration through the `Env` object:
 - **Cost**: exactly 1 number + optional text comment.
 - **Ambiguous**: anything else → ask user with keyboard.
 - Delimiters: whitespace, `/`, `\`, `|`.
+- **AI response parsing**: JSON-first (look for `{...}` with `sys`, `dia`, `pulse` keys), then fallback to numeric extraction from text.
 
 ### Google Sheets Integration
 - OAuth tokens are **cached in KV** under key `google_oauth_token` with ~55 min TTL.
 - Pressure: inserts a row at index 1 (`batchUpdate` + `insertDimension`), then writes to `A3`.
 - Costs: appends a row via `:append` endpoint.
 - Cyrillic sheet names are supported via `urlencoding::encode` + single-quote wrapping.
+
+### Inline Keyboard Callback Data
+- `confirm_pressure` — confirms pending pressure (from `AwaitingPressureConfirmation`)
+- `cancel_pressure` — cancels pending pressure
+- `select_option_N` — selects option N from multiple choice (e.g. `select_option_0`, `select_option_1`)
+- `cancel_option` — cancels multiple choice
+- All handled in `handle_callback_query()` in `lib.rs`
+
+### Telegram Service: `send_inline_message`
+- Used for sending messages with inline keyboards (not reply keyboards)
+- Used in multiple choice selection flow
+- `choice_keyboard(options_count)` generates buttons: "Вариант 1", "Вариант 2", ... + "❌ Cancel"
 
 ## Build & Deploy
 
@@ -106,7 +132,7 @@ npx wrangler secret put <SECRET_NAME>
 ## Important Constraints
 
 1. **Wasm Compatibility**: All crates must support `wasm32-unknown-unknown`. No native C/system dependencies. The `jwt-simple` crate uses `pure-rust` feature for this reason.
-2. **Free Tier Limits**: Keep CPU time under 10ms per request. Token caching in KV is critical for this.
+2. **Free Tier Limits**: Keep CPU time under 10ms per request. Token caching in KV is critical for this. Batch AI requests may increase CPU time — monitor usage.
 3. **Always return HTTP 200 to Telegram**: Even on errors — otherwise Telegram retries the webhook indefinitely.
 4. **Single user bot**: Access is restricted to one `ALLOWED_USERNAME`. This is not a multi-tenant system.
 5. **No `async main`**: This is a Cloudflare Worker, not a standalone binary. Entry point is `#[event(fetch)]`.
@@ -122,4 +148,5 @@ npx wrangler secret put <SECRET_NAME>
 | `jwt-simple`  | RS256 JWT signing for Google OAuth2        |
 | `urlencoding` | URL-encoding Cyrillic sheet names          |
 | `base64`      | Base64 encoding for AI vision image payloads |
+| `futures`     | `join_all` for parallel AI requests        |
 | `http`        | HTTP types                                 |
