@@ -7,8 +7,10 @@ use worker::*;
 /// - "@cf/llava-hf/llava-1.5-7b-hf" (lighter, less accurate)
 const DEFAULT_VISION_MODEL: &str = "@cf/meta/llama-3.2-11b-vision-instruct";
 
-/// Default number of parallel AI recognition attempts (can be overridden via AI_VISION_RETRIES)
-const DEFAULT_VISION_RETRIES: u32 = 4;
+/// Default number of parallel AI recognition requests.
+///
+/// Can be overridden via AI_VISION_PARALLEL_REQUESTS.
+const DEFAULT_VISION_PARALLEL_REQUESTS: u32 = 4;
 
 pub struct AiVisionService;
 
@@ -52,15 +54,18 @@ impl AiVisionService {
         }
     }
 
-    /// Runs multiple parallel recognition attempts and returns all successful responses.
-    /// The number of attempts is configured via AI_VISION_RETRIES env (default 4).
+    /// Runs multiple recognition requests in parallel and returns all successful responses.
+    /// This is not retry-after-failure logic; all requests are started together.
     pub async fn recognize_pressure_batch(env: &Env, image_bytes: &[u8]) -> Result<Vec<String>> {
-        let retries_str = get_env_or_secret(
+        let parallel_requests_str = get_env_or_secret(
             env,
-            "AI_VISION_RETRIES",
-            &DEFAULT_VISION_RETRIES.to_string(),
+            "AI_VISION_PARALLEL_REQUESTS",
+            &DEFAULT_VISION_PARALLEL_REQUESTS.to_string(),
         );
-        let retries: u32 = retries_str.parse().unwrap_or(DEFAULT_VISION_RETRIES);
+        let parallel_requests: u32 = parallel_requests_str
+            .parse()
+            .unwrap_or(DEFAULT_VISION_PARALLEL_REQUESTS)
+            .max(1);
 
         // Build the environment snapshot once (Env is not Send+Sync in worker-rs)
         let account_id = get_env_or_secret(env, "CLOUDFLARE_ACCOUNT_ID", "");
@@ -111,7 +116,7 @@ impl AiVisionService {
         // Use futures::future::join_all to run requests in parallel
         let mut handles = Vec::new();
 
-        for i in 0..retries {
+        for i in 0..parallel_requests {
             let ai_url = ai_url.clone();
             let input_json = input_json.clone();
             let auth_header = format!("Bearer {}", api_token.clone());
@@ -144,7 +149,14 @@ impl AiVisionService {
                 let body = resp.text().await.unwrap_or_default();
 
                 if status != 200 {
-                    console_log!("AI batch request {} error ({}): {}", i, status, body);
+                    crate::log_event!(
+                        "warn",
+                        "ai_vision.request.failed",
+                        "attempt={} status={} body_chars={}",
+                        i,
+                        status,
+                        body.chars().count()
+                    );
                     return (
                         i,
                         Err(worker::Error::from(format!(
@@ -175,7 +187,13 @@ impl AiVisionService {
                     return (i, Err(worker::Error::from("AI returned empty response")));
                 }
 
-                console_log!("AI batch request {} response: {}", i, ai_text);
+                crate::log_event!(
+                    "info",
+                    "ai_vision.request.succeeded",
+                    "attempt={} response_chars={}",
+                    i,
+                    ai_text.chars().count()
+                );
                 (i, Ok(ai_text))
             });
         }
@@ -186,10 +204,12 @@ impl AiVisionService {
             .filter_map(|(_i, result)| result.ok())
             .collect();
 
-        console_log!(
-            "AI batch complete: {} successful responses out of {} attempts",
+        crate::log_event!(
+            "info",
+            "ai_vision.batch.completed",
+            "successes={} attempts={}",
             results.len(),
-            retries
+            parallel_requests
         );
 
         if results.is_empty() {

@@ -1,5 +1,5 @@
-use worker::*;
 use serde::{Deserialize, Serialize};
+use worker::*;
 
 pub const BTN_SAVE: &str = "✅ Save";
 pub const BTN_CANCEL: &str = "❌ Cancel";
@@ -77,7 +77,10 @@ impl TelegramService {
             "text": text,
         });
         if let Some(kb) = keyboard {
-            payload.as_object_mut().unwrap().insert("reply_markup".to_string(), kb);
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("reply_markup".to_string(), kb);
         }
 
         let headers = Headers::new();
@@ -92,7 +95,12 @@ impl TelegramService {
         let mut resp = Fetch::Request(req).send().await?;
         if resp.status_code() != 200 {
             let err_text = resp.text().await?;
-            console_log!("Telegram Send Error: {}", err_text);
+            crate::log_event!(
+                "warn",
+                "telegram.send_message.failed",
+                "body_chars={}",
+                err_text.chars().count()
+            );
         }
         Ok(())
     }
@@ -123,7 +131,12 @@ impl TelegramService {
         let mut resp = Fetch::Request(req).send().await?;
         if resp.status_code() != 200 {
             let err_text = resp.text().await?;
-            console_log!("Telegram Inline Send Error: {}", err_text);
+            crate::log_event!(
+                "warn",
+                "telegram.send_inline_message.failed",
+                "body_chars={}",
+                err_text.chars().count()
+            );
         }
         Ok(())
     }
@@ -170,21 +183,17 @@ impl TelegramService {
         for i in 0..options_count {
             let label = format!("Вариант {}", i + 1);
             let data = format!("select_option_{}", i);
-            rows.push(vec![
-                serde_json::json!({
-                    "text": label,
-                    "callback_data": data
-                })
-            ]);
+            rows.push(vec![serde_json::json!({
+                "text": label,
+                "callback_data": data
+            })]);
         }
 
         // Cancel button
-        rows.push(vec![
-            serde_json::json!({
-                "text": BTN_CANCEL,
-                "callback_data": "cancel_option"
-            })
-        ]);
+        rows.push(vec![serde_json::json!({
+            "text": BTN_CANCEL,
+            "callback_data": "cancel_option"
+        })]);
 
         serde_json::json!({
             "inline_keyboard": rows
@@ -218,7 +227,8 @@ impl TelegramService {
         let get_file_resp: GetFileResponse = serde_json::from_str(&body)
             .map_err(|e| worker::Error::from(format!("getFile parse error: {}", e)))?;
 
-        let file_path = get_file_resp.result
+        let file_path = get_file_resp
+            .result
             .and_then(|r| r.file_path)
             .ok_or_else(|| worker::Error::from("No file_path in getFile response"))?;
 
@@ -226,13 +236,23 @@ impl TelegramService {
     }
 
     /// Answers a callback query (removes the "loading" state on the button)
-    pub async fn answer_callback_query(bot_token: &str, callback_query_id: &str, text: Option<&str>) -> Result<()> {
-        let url = format!("https://api.telegram.org/bot{}/answerCallbackQuery", bot_token);
+    pub async fn answer_callback_query(
+        bot_token: &str,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> Result<()> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/answerCallbackQuery",
+            bot_token
+        );
         let mut payload = serde_json::json!({
             "callback_query_id": callback_query_id,
         });
         if let Some(t) = text {
-            payload.as_object_mut().unwrap().insert("text".to_string(), serde_json::Value::String(t.to_string()));
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("text".to_string(), serde_json::Value::String(t.to_string()));
         }
 
         let headers = Headers::new();
@@ -247,21 +267,32 @@ impl TelegramService {
         let mut resp = Fetch::Request(req).send().await?;
         if resp.status_code() != 200 {
             let err_text = resp.text().await?;
-            console_log!("answerCallbackQuery Error: {}", err_text);
+            crate::log_event!(
+                "warn",
+                "telegram.answer_callback_query.failed",
+                "body_chars={}",
+                err_text.chars().count()
+            );
         }
         Ok(())
     }
 
     /// Downloads a file from Telegram file server and returns its bytes
     pub async fn download_file(bot_token: &str, file_path: &str) -> Result<Vec<u8>> {
-        let url = format!("https://api.telegram.org/file/bot{}/{}", bot_token, file_path);
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            bot_token, file_path
+        );
 
         let req = Request::new(&url, Method::Get)?;
         let mut resp = Fetch::Request(req).send().await?;
 
         if resp.status_code() != 200 {
             let err_text = resp.text().await?;
-            return Err(worker::Error::from(format!("download file failed: {}", err_text)));
+            return Err(worker::Error::from(format!(
+                "download file failed: {}",
+                err_text
+            )));
         }
 
         let bytes = resp.bytes().await?;

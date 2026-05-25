@@ -11,6 +11,15 @@ pub enum Action {
     },
 }
 
+impl Action {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Pressure { .. } => "pressure",
+            Self::Cost { .. } => "cost",
+        }
+    }
+}
+
 pub struct ParserService;
 
 impl ParserService {
@@ -88,11 +97,11 @@ impl ParserService {
         let mut comment_parts = Vec::new();
 
         for p in parts {
-            if let Ok(num) = p.parse::<i32>() {
-                if amount.is_none() {
-                    amount = Some(num);
-                    continue;
-                }
+            if let Ok(num) = p.parse::<i32>()
+                && amount.is_none()
+            {
+                amount = Some(num);
+                continue;
             }
             comment_parts.push(p);
         }
@@ -172,10 +181,10 @@ impl ParserService {
                     if depth == 0 {
                         if let Some(start_idx) = start {
                             let json_str = &text[start_idx..=idx];
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                if let Some(result) = Self::pressure_from_json_value(&value) {
-                                    last_valid = Some(result);
-                                }
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str)
+                                && let Some(result) = Self::pressure_from_json_value(&value)
+                            {
+                                last_valid = Some(result);
                             }
                         }
                         start = None;
@@ -234,5 +243,67 @@ impl ParserService {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_action_should_parse_two_numbers_as_pressure() {
+        assert_eq!(
+            ParserService::detect_action("120/80"),
+            Some(Action::Pressure {
+                sys: 120,
+                dia: 80,
+                pulse: None
+            })
+        );
+    }
+
+    #[test]
+    fn detect_action_should_parse_single_number_with_words_as_cost() {
+        assert_eq!(
+            ParserService::detect_action("250 taxi"),
+            Some(Action::Cost {
+                amount: 250,
+                comment: "taxi".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_as_pressure_should_reject_out_of_range_pulse() {
+        assert_eq!(ParserService::parse_as_pressure("120 80 250"), None);
+    }
+
+    #[test]
+    fn parse_manual_cost_should_keep_second_number_in_comment() {
+        assert_eq!(
+            ParserService::parse_manual_cost("250 taxi 2"),
+            Some(Action::Cost {
+                amount: 250,
+                comment: "taxi 2".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_ai_pressure_response_should_parse_json_inside_prose() {
+        assert_eq!(
+            ParserService::parse_ai_pressure_response(
+                "reading looks like {\"sys\": 121, \"dia\": 79, \"pulse\": 68}"
+            ),
+            Some((121, 79, Some(68)))
+        );
+    }
+
+    #[test]
+    fn parse_ai_pressure_response_should_ignore_invalid_json_range() {
+        assert_eq!(
+            ParserService::parse_ai_pressure_response("{\"sys\": 260, \"dia\": 79, \"pulse\": 68}"),
+            None
+        );
     }
 }
