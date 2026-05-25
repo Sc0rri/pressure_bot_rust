@@ -135,19 +135,7 @@ impl ParserService {
         None
     }
 
-    /// Attempts to parse a JSON object with sys, dia, pulse keys from text.
-    /// Looks for a `{...}` substring and parses it as JSON.
-    fn parse_json_response(text: &str) -> Option<(i32, i32, Option<i32>)> {
-        // Find the first '{' and last '}'
-        let start = text.find('{')?;
-        let end = text.rfind('}')?;
-        if start >= end {
-            return None;
-        }
-        let json_str = &text[start..=end];
-
-        // Try to parse as JSON
-        let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    fn pressure_from_json_value(value: &serde_json::Value) -> Option<(i32, i32, Option<i32>)> {
         let obj = value.as_object()?;
 
         let sys = obj.get("sys")?.as_i64()? as i32;
@@ -161,6 +149,43 @@ impl ParserService {
         } else {
             None
         }
+    }
+
+    /// Attempts to parse any valid JSON object with sys, dia, pulse keys from text.
+    /// AI vision models often wrap the object in prose or include an example before
+    /// the final answer, so each balanced `{...}` block is tried independently.
+    fn parse_json_response(text: &str) -> Option<(i32, i32, Option<i32>)> {
+        let mut start = None;
+        let mut depth = 0usize;
+        let mut last_valid = None;
+
+        for (idx, ch) in text.char_indices() {
+            match ch {
+                '{' => {
+                    if depth == 0 {
+                        start = Some(idx);
+                    }
+                    depth += 1;
+                }
+                '}' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(start_idx) = start {
+                            let json_str = &text[start_idx..=idx];
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                if let Some(result) = Self::pressure_from_json_value(&value) {
+                                    last_valid = Some(result);
+                                }
+                            }
+                        }
+                        start = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        last_valid
     }
 
     /// Parses AI response text that might contain blood pressure values
@@ -177,14 +202,19 @@ impl ParserService {
 
         // Fallback: try to find numbers in the response
         let parts: Vec<&str> = clean
-            .split(|c: char| c.is_whitespace() || c == '/' || c == '\\' || c == '|' || c == ':' || c == ',')
+            .split(|c: char| {
+                c.is_whitespace() || c == '/' || c == '\\' || c == '|' || c == ':' || c == ','
+            })
             .filter(|s| !s.is_empty())
             .collect();
 
         let mut nums: Vec<i32> = Vec::new();
         for p in &parts {
             // Clean each token: strip trailing/leading non-digit chars like '.', ',', ')', etc.
-            let cleaned: String = p.chars().filter(|c| c.is_ascii_digit() || *c == '-').collect();
+            let cleaned: String = p
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
             if cleaned.is_empty() {
                 continue;
             }
