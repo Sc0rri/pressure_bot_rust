@@ -277,6 +277,64 @@ impl TelegramService {
         Ok(())
     }
 
+    /// Silently removes the reply keyboard by sending a temporary character and deleting the message immediately
+    pub async fn remove_keyboard_silently(bot_token: &str, chat_id: i64) -> Result<()> {
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "text": ".",
+            "reply_markup": {
+                "remove_keyboard": true
+            }
+        });
+
+        let headers = Headers::new();
+        headers.set("Content-Type", "application/json")?;
+
+        let mut req_init = RequestInit::new();
+        req_init.with_method(Method::Post);
+        req_init.with_headers(headers);
+        req_init.with_body(Some(serde_json::to_string(&payload)?.into()));
+
+        let req = Request::new_with_init(&url, &req_init)?;
+        let mut resp = Fetch::Request(req).send().await?;
+        let status = resp.status_code();
+        let body = resp.text().await?;
+
+        if status == 200 {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(msg_id) = parsed.get("result").and_then(|r| r.get("message_id")).and_then(|id| id.as_i64()) {
+                    let delete_url = format!("https://api.telegram.org/bot{}/deleteMessage", bot_token);
+                    let delete_payload = serde_json::json!({
+                        "chat_id": chat_id,
+                        "message_id": msg_id
+                    });
+
+                    let del_headers = Headers::new();
+                    del_headers.set("Content-Type", "application/json")?;
+
+                    let mut del_req_init = RequestInit::new();
+                    del_req_init.with_method(Method::Post);
+                    del_req_init.with_headers(del_headers);
+                    del_req_init.with_body(Some(serde_json::to_string(&delete_payload)?.into()));
+
+                    if let Ok(del_req) = Request::new_with_init(&delete_url, &del_req_init) {
+                        let _ = Fetch::Request(del_req).send().await;
+                    }
+                }
+            }
+        } else {
+            crate::log_event!(
+                "warn",
+                "telegram.remove_keyboard_silently.failed",
+                "status={} body={}",
+                status,
+                body
+            );
+        }
+        Ok(())
+    }
+
     /// Downloads a file from Telegram file server and returns its bytes
     pub async fn download_file(bot_token: &str, file_path: &str) -> Result<Vec<u8>> {
         let url = format!(

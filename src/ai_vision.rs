@@ -45,7 +45,13 @@ impl AiVisionService {
     }
 
     /// Builds the JSON request payload for a vision model call.
-    fn build_request(model: &str, image_bytes: &[u8], mime: &str) -> serde_json::Value {
+    fn build_request(
+        model: &str,
+        image_bytes: &[u8],
+        mime: &str,
+        temperature: Option<f64>,
+        seed: Option<u32>,
+    ) -> serde_json::Value {
         // Encode image to base64
         use base64::Engine;
         let engine = base64::engine::general_purpose::STANDARD;
@@ -53,7 +59,7 @@ impl AiVisionService {
 
         let model_is_llama = model.contains("llama");
 
-        if model_is_llama {
+        let mut payload = if model_is_llama {
             serde_json::json!({
                 "messages": [
                     {
@@ -80,7 +86,20 @@ impl AiVisionService {
                 "prompt": "Look at this vertical blood pressure monitor screen. Read the three numbers from top to bottom:\n1. Top row (SYS): Systolic pressure (80-250).\n2. Middle row (DIA): Diastolic pressure (40-150).\n3. Bottom row (PULSE): Pulse rate (40-200).\n\nBe extremely precise reading each digit. Ignore the vertical indicator bar and rectangular blocks on the far right of the screen (along with '-135' and '-85' ticks). Also ignore any decimal dots.\n\nCRITICAL OUTPUT RULES:\n- The first character of your response must be `{`.\n- Return exactly one JSON object with keys: sys (integer), dia (integer), pulse (integer).\n- Do not include explanations, labels, markdown, code fences, or examples in the response.",
                 "image": image_array
             })
+        };
+
+        if let Some(t) = temperature {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("temperature".to_string(), serde_json::Value::from(t));
+            }
         }
+        if let Some(s) = seed {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("seed".to_string(), serde_json::Value::from(s));
+            }
+        }
+
+        payload
     }
 
     /// Runs multiple recognition requests in parallel and returns all successful responses.
@@ -139,16 +158,30 @@ impl AiVisionService {
             "image/jpeg"
         };
 
-        let input = Self::build_request(&model, image_bytes, mime);
-        let input_json = serde_json::to_string(&input)?;
-
         // Use futures::future::join_all to run requests in parallel
         let mut handles = Vec::new();
 
         for i in 0..parallel_requests {
             let ai_url = ai_url.clone();
-            let input_json = input_json.clone();
             let auth_header = format!("Bearer {}", api_token.clone());
+
+            // Vary temperature and seed for each request to obtain diverse OCR options
+            let temp = 0.2 + (i as f64) * 0.15;
+            let seed = 42 + i * 1000;
+            let input = Self::build_request(&model, image_bytes, mime, Some(temp), Some(seed));
+            let input_json = match serde_json::to_string(&input) {
+                Ok(json) => json,
+                Err(e) => {
+                    crate::log_event!(
+                        "error",
+                        "ai_vision.request.json_failed",
+                        "attempt={} error={:?}",
+                        i,
+                        e
+                    );
+                    continue;
+                }
+            };
 
             handles.push(async move {
                 let headers = Headers::new();

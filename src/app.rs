@@ -155,6 +155,7 @@ async fn handle_text(env: Env, chat_id: i64, text: String) -> Result<()> {
     let transition = state.text_transition(&text);
     if transition == TextTransition::Cancel {
         delete_state(&kv, &state_key, chat_id).await?;
+        TelegramService::remove_keyboard_silently(&bot_token, chat_id).await?;
         return Ok(());
     }
 
