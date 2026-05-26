@@ -7,12 +7,43 @@ use worker::*;
 /// - "@cf/llava-hf/llava-1.5-7b-hf" (lighter, less accurate)
 const DEFAULT_VISION_MODEL: &str = "@cf/meta/llama-3.2-11b-vision-instruct";
 
-/// Default number of parallel AI recognition attempts (can be overridden via AI_VISION_RETRIES)
-const DEFAULT_VISION_RETRIES: u32 = 4;
+/// Default number of parallel AI recognition requests.
+///
+/// Can be overridden via AI_VISION_PARALLEL_REQUESTS.
+const DEFAULT_VISION_PARALLEL_REQUESTS: u32 = 4;
 
 pub struct AiVisionService;
 
 impl AiVisionService {
+    fn value_keys(value: &serde_json::Value) -> String {
+        value
+            .as_object()
+            .map(|obj| obj.keys().map(String::as_str).collect::<Vec<_>>().join(","))
+            .unwrap_or_else(|| value_type_name(value).to_string())
+    }
+
+    fn extract_text_response(ai_response: &serde_json::Value) -> Option<String> {
+        let result = ai_response.get("result").unwrap_or(ai_response);
+
+        [
+            result.get("response"),
+            result.get("description"),
+            result.get("text"),
+            result.get("output"),
+            result.get("output_text"),
+            result.get("tool_calls"),
+            ai_response.get("response"),
+            ai_response.get("description"),
+            ai_response.get("text"),
+            ai_response.get("output"),
+            ai_response.get("output_text"),
+            ai_response.get("tool_calls"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(string_from_value)
+    }
+
     /// Builds the JSON request payload for a vision model call.
     fn build_request(model: &str, image_bytes: &[u8], mime: &str) -> serde_json::Value {
         // Encode image to base64
@@ -52,15 +83,18 @@ impl AiVisionService {
         }
     }
 
-    /// Runs multiple parallel recognition attempts and returns all successful responses.
-    /// The number of attempts is configured via AI_VISION_RETRIES env (default 4).
+    /// Runs multiple recognition requests in parallel and returns all successful responses.
+    /// This is not retry-after-failure logic; all requests are started together.
     pub async fn recognize_pressure_batch(env: &Env, image_bytes: &[u8]) -> Result<Vec<String>> {
-        let retries_str = get_env_or_secret(
+        let parallel_requests_str = get_env_or_secret(
             env,
-            "AI_VISION_RETRIES",
-            &DEFAULT_VISION_RETRIES.to_string(),
+            "AI_VISION_PARALLEL_REQUESTS",
+            &DEFAULT_VISION_PARALLEL_REQUESTS.to_string(),
         );
-        let retries: u32 = retries_str.parse().unwrap_or(DEFAULT_VISION_RETRIES);
+        let parallel_requests: u32 = parallel_requests_str
+            .parse()
+            .unwrap_or(DEFAULT_VISION_PARALLEL_REQUESTS)
+            .max(1);
 
         // Build the environment snapshot once (Env is not Send+Sync in worker-rs)
         let account_id = get_env_or_secret(env, "CLOUDFLARE_ACCOUNT_ID", "");
@@ -111,7 +145,7 @@ impl AiVisionService {
         // Use futures::future::join_all to run requests in parallel
         let mut handles = Vec::new();
 
-        for i in 0..retries {
+        for i in 0..parallel_requests {
             let ai_url = ai_url.clone();
             let input_json = input_json.clone();
             let auth_header = format!("Bearer {}", api_token.clone());
@@ -119,9 +153,23 @@ impl AiVisionService {
             handles.push(async move {
                 let headers = Headers::new();
                 if let Err(e) = headers.set("Content-Type", "application/json") {
+                    crate::log_event!(
+                        "error",
+                        "ai_vision.request.header_failed",
+                        "attempt={} header=content-type error={}",
+                        i,
+                        e
+                    );
                     return (i, Err(worker::Error::from(format!("Header error: {}", e))));
                 }
                 if let Err(e) = headers.set("Authorization", &auth_header) {
+                    crate::log_event!(
+                        "error",
+                        "ai_vision.request.header_failed",
+                        "attempt={} header=authorization error={}",
+                        i,
+                        e
+                    );
                     return (i, Err(worker::Error::from(format!("Header error: {}", e))));
                 }
 
@@ -132,19 +180,57 @@ impl AiVisionService {
 
                 let req = match Request::new_with_init(&ai_url, &req_init) {
                     Ok(r) => r,
-                    Err(e) => return (i, Err(e)),
+                    Err(e) => {
+                        crate::log_event!(
+                            "error",
+                            "ai_vision.request.build_failed",
+                            "attempt={} error={:?}",
+                            i,
+                            e
+                        );
+                        return (i, Err(e));
+                    }
                 };
 
                 let mut resp = match Fetch::Request(req).send().await {
                     Ok(r) => r,
-                    Err(e) => return (i, Err(e)),
+                    Err(e) => {
+                        crate::log_event!(
+                            "error",
+                            "ai_vision.request.fetch_failed",
+                            "attempt={} error={:?}",
+                            i,
+                            e
+                        );
+                        return (i, Err(e));
+                    }
                 };
 
                 let status = resp.status_code();
-                let body = resp.text().await.unwrap_or_default();
+                let body = match resp.text().await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        crate::log_event!(
+                            "error",
+                            "ai_vision.response.read_failed",
+                            "attempt={} status={} error={:?}",
+                            i,
+                            status,
+                            e
+                        );
+                        return (i, Err(e));
+                    }
+                };
 
                 if status != 200 {
-                    console_log!("AI batch request {} error ({}): {}", i, status, body);
+                    crate::log_event!(
+                        "warn",
+                        "ai_vision.request.failed",
+                        "attempt={} status={} body_chars={}",
+                        i,
+                        status,
+                        body.chars().count()
+                    );
                     return (
                         i,
                         Err(worker::Error::from(format!(
@@ -157,6 +243,14 @@ impl AiVisionService {
                 let ai_response: serde_json::Value = match serde_json::from_str(&body) {
                     Ok(v) => v,
                     Err(e) => {
+                        crate::log_event!(
+                            "warn",
+                            "ai_vision.response.invalid_json",
+                            "attempt={} body_chars={} error={}",
+                            i,
+                            body.chars().count(),
+                            e
+                        );
                         return (
                             i,
                             Err(worker::Error::from(format!("AI JSON parse error: {}", e))),
@@ -164,18 +258,46 @@ impl AiVisionService {
                     }
                 };
 
-                let ai_text = ai_response
-                    .get("result")
-                    .and_then(|r| r.get("response").or_else(|| r.get("description")))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let ai_text = Self::extract_text_response(&ai_response).unwrap_or_default();
 
                 if ai_text.is_empty() {
+                    let result_keys = ai_response
+                        .get("result")
+                        .map(Self::value_keys)
+                        .unwrap_or_else(|| "missing".to_string());
+                    crate::log_event!(
+                        "warn",
+                        "ai_vision.response.empty_text",
+                        "attempt={} body_chars={} top_keys={} result_keys={}",
+                        i,
+                        body.chars().count(),
+                        Self::value_keys(&ai_response),
+                        result_keys
+                    );
+                    crate::log_event!(
+                        "warn",
+                        "ai_vision.response.raw_preview",
+                        "attempt={} body_preview={}",
+                        i,
+                        log_preview(&body)
+                    );
                     return (i, Err(worker::Error::from("AI returned empty response")));
                 }
 
-                console_log!("AI batch request {} response: {}", i, ai_text);
+                crate::log_event!(
+                    "info",
+                    "ai_vision.request.succeeded",
+                    "attempt={} response_chars={}",
+                    i,
+                    ai_text.chars().count()
+                );
+                crate::log_event!(
+                    "info",
+                    "ai_vision.response.recognized",
+                    "attempt={} response={}",
+                    i,
+                    log_preview(&ai_text)
+                );
                 (i, Ok(ai_text))
             });
         }
@@ -186,10 +308,12 @@ impl AiVisionService {
             .filter_map(|(_i, result)| result.ok())
             .collect();
 
-        console_log!(
-            "AI batch complete: {} successful responses out of {} attempts",
+        crate::log_event!(
+            "info",
+            "ai_vision.batch.completed",
+            "successes={} attempts={}",
             results.len(),
-            retries
+            parallel_requests
         );
 
         if results.is_empty() {
@@ -197,5 +321,147 @@ impl AiVisionService {
         }
 
         Ok(results)
+    }
+}
+
+fn string_from_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        serde_json::Value::Array(items) => items.iter().find_map(string_from_value),
+        serde_json::Value::Object(obj) => {
+            if obj.contains_key("sys") && obj.contains_key("dia") {
+                serde_json::to_string(value).ok()
+            } else {
+                obj.values().find_map(string_from_value)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn log_preview(value: &str) -> String {
+    const MAX_CHARS: usize = 700;
+
+    let normalized = value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+
+    let mut preview: String = normalized.chars().take(MAX_CHARS).collect();
+    if normalized.chars().count() > MAX_CHARS {
+        preview.push_str("...");
+    }
+    preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_text_response_should_read_result_response() {
+        let value = serde_json::json!({
+            "result": {
+                "response": "{\"sys\":120,\"dia\":80,\"pulse\":70}"
+            }
+        });
+
+        assert_eq!(
+            AiVisionService::extract_text_response(&value),
+            Some("{\"sys\":120,\"dia\":80,\"pulse\":70}".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_text_response_should_read_result_output() {
+        let value = serde_json::json!({
+            "result": {
+                "output": "{\"sys\":121,\"dia\":81,\"pulse\":71}"
+            }
+        });
+
+        assert_eq!(
+            AiVisionService::extract_text_response(&value),
+            Some("{\"sys\":121,\"dia\":81,\"pulse\":71}".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_text_response_should_read_first_string_from_array_output() {
+        let value = serde_json::json!({
+            "result": {
+                "output": [
+                    {"ignored": true},
+                    "{\"sys\":122,\"dia\":82,\"pulse\":72}"
+                ]
+            }
+        });
+
+        assert_eq!(
+            AiVisionService::extract_text_response(&value),
+            Some("{\"sys\":122,\"dia\":82,\"pulse\":72}".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_text_response_should_serialize_object_response() {
+        let value = serde_json::json!({
+            "result": {
+                "response": {
+                    "sys": 123,
+                    "dia": 83,
+                    "pulse": 73
+                }
+            }
+        });
+
+        assert_eq!(
+            AiVisionService::extract_text_response(&value),
+            Some("{\"dia\":83,\"pulse\":73,\"sys\":123}".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_text_response_should_fall_back_to_tool_calls() {
+        let value = serde_json::json!({
+            "result": {
+                "response": "",
+                "tool_calls": [
+                    {
+                        "arguments": {
+                            "sys": 124,
+                            "dia": 84,
+                            "pulse": 74
+                        }
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            AiVisionService::extract_text_response(&value),
+            Some("{\"dia\":84,\"pulse\":74,\"sys\":124}".to_string())
+        );
+    }
+
+    #[test]
+    fn log_preview_should_escape_multiline_text_and_truncate() {
+        let long_text = format!("{}\n{}", "a".repeat(700), "tail");
+
+        let preview = log_preview(&long_text);
+
+        assert_eq!(preview, format!("{}...", "a".repeat(700)));
     }
 }

@@ -6,13 +6,13 @@ It processes incoming Telegram webhooks, parses blood pressure or expense inputs
 
 ## ⚡ Features & Enhancements in Rust
 
-1.  **📸 Advanced AI Photo OCR with Multi-Attempt Recognition:** Sends high-resolution images (`photos.last()`) of your blood pressure monitor to **Cloudflare Workers AI** (`@cf/meta/llama-3.2-11b-vision-instruct`) in **multiple parallel attempts** (configurable via `AI_VISION_RETRIES`, default 4). The vision prompt requires **structured JSON output** (`{"sys": 135, "dia": 85, "pulse": 72}`), making parsing reliable. If multiple different readings are recognized, the bot presents a choice via inline keyboard buttons.
+1.  **📸 Advanced AI Photo OCR with Multi-Attempt Recognition:** Sends high-resolution images (`photos.last()`) of your blood pressure monitor to **Cloudflare Workers AI** (`@cf/meta/llama-3.2-11b-vision-instruct`) using **multiple parallel requests** (configurable via `AI_VISION_PARALLEL_REQUESTS`, default 4). The vision prompt requires **structured JSON output** (`{"sys": 135, "dia": 85, "pulse": 72}`), making parsing reliable. If multiple different readings are recognized, the bot presents a choice via inline keyboard buttons.
 2.  **📊 Multiple Options Selection:** When AI returns different readings across attempts, the user sees all unique variants with inline buttons ("Вариант 1", "Вариант 2", ...) to pick the correct one.
-3.  **💾 Strongly-Typed State Machine:** Implements a type-safe, robust finite state machine (`UserState`) serialized as a JSON string in KV. This eliminates race conditions, session desynchronization, and fragmented keys.
+3.  **💾 Strongly-Typed State Machine:** Implements a typed finite state machine (`UserState`) serialized as a JSON string in KV. State transitions live in `src/state.rs`, while Worker orchestration lives in `src/app.rs`.
 4.  **⌨️ Centralized UI Button Labels:** Button labels (`✅ Save`, `❌ Cancel`, `🩺 Pressure`, `💸 Cost`) are centralized as public constants in `src/telegram.rs`, making the matching pipeline entirely typo-safe.
 5.  **🛡️ Low CPU Footprint OAuth2 Caching:** Google Sheets API OAuth tokens are cached in Cloudflare KV with a 55-minute expiration. This drops average request CPU times down to **< 5ms** and ensures you stay safely under the free tier execution limits.
 6.  **📦 Zero Heavy Crypto Bloat:** Uses the pure-Rust `jwt-simple` crate for fast Wasm-compatible RS256 token signing.
-7.  **⏱️ Embedded Timezone Support:** Statically embeds timezone databases using Wasm-compatible `chrono-tz`, preserving your precise local logging times (e.g. `Europe/Kiev`).
+7.  **⏱️ Embedded Timezone Support:** Statically embeds timezone databases using Wasm-compatible `chrono-tz`, preserving precise local spreadsheet timestamps (e.g. `Europe/Kiev`). Worker logs use UTC timestamps via `log_event!`.
 8.  **🌐 Cyrillic Sheets & Custom Range Encoding:** Implements native percent-encoding and automatic single-quote range escaping, handling Cyrillic tab names with spaces and parentheses (like `'Значения (2026 )'!A3`) perfectly.
 9.  **📢 Direct Telegram Error Reporting:** Instantly forwards Google Sheets API errors directly to your Telegram chat to prevent silent failures.
 10. **⌨️ Automatic Keyboard Management:** Seamlessly collapses and hides the Telegram custom keyboard when operations are completed or canceled without spamming "Cancelled" messages.
@@ -21,7 +21,7 @@ It processes incoming Telegram webhooks, parses blood pressure or expense inputs
 
 ## 🧠 Operation Logic & Message Processing Flow
 
-The bot runs a completely stateless, deterministic decision pipeline for every incoming message. Below is the exact step-by-step logic representing our `UserState` machine:
+The bot runs a deterministic decision pipeline for every incoming message, with short-lived per-chat state stored in KV. Below is the current `UserState` machine:
 
 ```mermaid
 stateDiagram-v2
@@ -65,10 +65,10 @@ stateDiagram-v2
 ### 1. Photo Recognition Flow (with Multi-Attempt Optimization)
 When a user sends a photo:
 - The bot downloads the highest resolution photo (`photos.last()`) from Telegram servers.
-- Sends **N parallel requests** (default 4, configurable via `AI_VISION_RETRIES`) to **Cloudflare Workers AI** with an optimized prompt requiring **JSON output** (`{"sys": 135, "dia": 85, "pulse": 72}`).
+- Sends **N parallel requests** (default 4, configurable via `AI_VISION_PARALLEL_REQUESTS`) to **Cloudflare Workers AI** with an optimized prompt requiring **JSON output** (`{"sys": 135, "dia": 85, "pulse": 72}`).
 - Parses each response: first tries JSON extraction, falls back to numeric text parsing.
 - Collects all **unique valid** readings.
-- **0 unique readings**: Shows error with the first AI response text for debugging.
+- **0 unique readings**: Shows an error and asks the user to enter pressure manually.
 - **1 unique reading**: Saves as `UserState::AwaitingPressureConfirmation`, offers **✅ Save** / **❌ Cancel** keyboard.
 - **2+ unique readings**: Saves as `UserState::AwaitingMultipleChoice { options }`, shows inline keyboard with "Вариант 1", "Вариант 2", ... buttons for selection.
 - On selection or **✅ Save**: logs to Google Sheets Pressure tab.
@@ -151,10 +151,10 @@ npx wrangler secret put AI_VISION_MODEL
 # Value: @cf/llava-hf/llava-1.5-7b-hf
 ```
 
-### Multi-Attempt Recognition (Optional)
+### Parallel AI Recognition Requests (Optional)
 By default the bot makes 4 parallel AI requests to increase accuracy. To change this:
 ```bash
-npx wrangler secret put AI_VISION_RETRIES
+npx wrangler secret put AI_VISION_PARALLEL_REQUESTS
 # Value: 3 (or any number)
 ```
 
@@ -191,12 +191,17 @@ curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo
 ├── Cargo.toml         # Optimized dependency tree (worker, base64, jwt-simple, chrono, futures)
 ├── wrangler.toml      # KV bindings, AI binding, build targets, metadata
 ├── src/
-│   ├── lib.rs         # Pure Rust event handler, parsing engine, Sheets APIs, photo flow
+│   ├── lib.rs         # Cloudflare Worker HTTP entrypoint
+│   ├── app.rs         # Telegram update orchestration, KV state IO, photo/text/callback flow
+│   ├── state.rs       # UserState, PendingPressure, pure text transition logic
+│   ├── logger.rs      # UTC timestamped log_event! macro
 │   ├── telegram.rs    # Telegram API models (Update, Message, PhotoSize) and service
 │   ├── parser.rs      # Text parsing: blood pressure, costs, AI response (JSON + fallback)
 │   ├── ai_vision.rs   # Workers AI integration: batch parallel photo recognition
 │   ├── operations.rs  # Google Sheets operations (add_pressure, add_cost)
-│   └── google.rs      # Google OAuth2 authentication and API requests
+│   └── google/
+│       ├── mod.rs     # Google Sheets HTTP client
+│       └── auth.rs    # Google OAuth2 authentication and KV token caching
 ├── agents.md          # Agent instructions for AI coding assistants
 └── README.md          # Setup & instruction guide
 ```

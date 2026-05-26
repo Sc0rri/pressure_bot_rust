@@ -1,8 +1,8 @@
-use worker::*;
-use crate::google::GoogleSheetsService;
-use crate::telegram::TelegramService;
-use crate::parser::Action;
 use crate::get_env_or_secret;
+use crate::google::GoogleSheetsService;
+use crate::parser::Action;
+use crate::telegram::TelegramService;
+use worker::*;
 
 pub struct OperationsService;
 
@@ -24,16 +24,39 @@ impl OperationsService {
                 let pressure_sheet_id: i64 = get_env_or_secret(env, "PRESSURE_SHEET_ID", "0")
                     .parse()
                     .unwrap_or(0);
-                
-                if let Err(e) = Self::add_pressure(token, &sheet_id, pressure_sheet_id, &pressure_sheet, &tz_str, sys, dia, pulse).await {
-                    console_log!("add_pressure failed: {:?}", e);
-                    TelegramService::send_message(bot_token, chat_id, &format!("❌ Error saving pressure: {}", e), Some(TelegramService::remove_keyboard())).await?;
+
+                if let Err(e) = Self::add_pressure(
+                    token,
+                    &sheet_id,
+                    pressure_sheet_id,
+                    &pressure_sheet,
+                    &tz_str,
+                    sys,
+                    dia,
+                    pulse,
+                )
+                .await
+                {
+                    crate::log_event!("error", "sheets.pressure.save_failed", "error={:?}", e);
+                    TelegramService::send_message(
+                        bot_token,
+                        chat_id,
+                        &format!("❌ Error saving pressure: {}", e),
+                        Some(TelegramService::remove_keyboard()),
+                    )
+                    .await?;
                 } else {
                     let mut msg = format!("✅ Pressure saved: {}/{}", sys, dia);
                     if let Some(p) = pulse {
                         msg.push_str(&format!(" pulse {}", p));
                     }
-                    TelegramService::send_message(bot_token, chat_id, &msg, Some(TelegramService::remove_keyboard())).await?;
+                    TelegramService::send_message(
+                        bot_token,
+                        chat_id,
+                        &msg,
+                        Some(TelegramService::remove_keyboard()),
+                    )
+                    .await?;
                 }
             }
             Action::Cost { amount, comment } => {
@@ -42,15 +65,37 @@ impl OperationsService {
                     .parse()
                     .unwrap_or(0);
 
-                if let Err(e) = Self::add_cost(token, &sheet_id, &costs_sheet, costs_sheet_id, &tz_str, amount, &comment).await {
-                    console_log!("add_cost failed: {:?}", e);
-                    TelegramService::send_message(bot_token, chat_id, &format!("❌ Error saving cost: {}", e), Some(TelegramService::remove_keyboard())).await?;
+                if let Err(e) = Self::add_cost(
+                    token,
+                    &sheet_id,
+                    &costs_sheet,
+                    costs_sheet_id,
+                    &tz_str,
+                    amount,
+                    &comment,
+                )
+                .await
+                {
+                    crate::log_event!("error", "sheets.cost.save_failed", "error={:?}", e);
+                    TelegramService::send_message(
+                        bot_token,
+                        chat_id,
+                        &format!("❌ Error saving cost: {}", e),
+                        Some(TelegramService::remove_keyboard()),
+                    )
+                    .await?;
                 } else {
                     let mut msg = format!("✅ Cost saved: {}", amount);
                     if !comment.is_empty() {
                         msg.push_str(&format!(" {}", comment));
                     }
-                    TelegramService::send_message(bot_token, chat_id, &msg, Some(TelegramService::remove_keyboard())).await?;
+                    TelegramService::send_message(
+                        bot_token,
+                        chat_id,
+                        &msg,
+                        Some(TelegramService::remove_keyboard()),
+                    )
+                    .await?;
                 }
             }
         }
@@ -91,21 +136,29 @@ impl OperationsService {
                 }
             ]
         });
-        
-        let mut resp = GoogleSheetsService::request(token, &batch_update_url, Method::Post, Some(batch_update_payload)).await?;
+
+        let mut resp = GoogleSheetsService::request(
+            token,
+            &batch_update_url,
+            Method::Post,
+            Some(batch_update_payload),
+        )
+        .await?;
         if resp.status_code() != 200 {
             let err_text = resp.text().await?;
-            return Err(worker::Error::from(format!("Prepend insert row failed: {}", err_text)));
+            return Err(worker::Error::from(format!(
+                "Prepend insert row failed: {}",
+                err_text
+            )));
         }
 
         // 2. Update values at A3 (replicating Go's original logic).
         let range_raw = format!("'{}'!A3", pressure_sheet);
         let range_encoded = urlencoding::encode(&range_raw);
-        
+
         let update_url = format!(
             "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption=USER_ENTERED",
-            sheet_id,
-            range_encoded
+            sheet_id, range_encoded
         );
         let pulse_val = pulse.map(|p| p.to_string()).unwrap_or_default();
         let values_payload = serde_json::json!({
@@ -113,11 +166,16 @@ impl OperationsService {
                 [timestamp, sys.to_string(), dia.to_string(), pulse_val]
             ]
         });
-        
-        let mut resp2 = GoogleSheetsService::request(token, &update_url, Method::Put, Some(values_payload)).await?;
+
+        let mut resp2 =
+            GoogleSheetsService::request(token, &update_url, Method::Put, Some(values_payload))
+                .await?;
         if resp2.status_code() != 200 {
             let err_text = resp2.text().await?;
-            return Err(worker::Error::from(format!("Prepend update values failed: {}", err_text)));
+            return Err(worker::Error::from(format!(
+                "Prepend update values failed: {}",
+                err_text
+            )));
         }
 
         Ok(())
@@ -141,19 +199,23 @@ impl OperationsService {
 
         let append_url = format!(
             "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS",
-            sheet_id,
-            range_encoded
+            sheet_id, range_encoded
         );
         let append_payload = serde_json::json!({
             "values": [
                 [timestamp, amount.to_string(), comment]
             ]
         });
-        
-        let mut resp = GoogleSheetsService::request(token, &append_url, Method::Post, Some(append_payload)).await?;
+
+        let mut resp =
+            GoogleSheetsService::request(token, &append_url, Method::Post, Some(append_payload))
+                .await?;
         if resp.status_code() != 200 {
             let err_text = resp.text().await?;
-            return Err(worker::Error::from(format!("Append cost failed: {}", err_text)));
+            return Err(worker::Error::from(format!(
+                "Append cost failed: {}",
+                err_text
+            )));
         }
 
         Ok(())
