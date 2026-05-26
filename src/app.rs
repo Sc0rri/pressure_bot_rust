@@ -152,7 +152,8 @@ async fn handle_text(env: Env, chat_id: i64, text: String) -> Result<()> {
         state_name(&state)
     );
 
-    if state.text_transition(&text) == TextTransition::Cancel {
+    let transition = state.text_transition(&text);
+    if transition == TextTransition::Cancel {
         delete_state(&kv, &state_key, chat_id).await?;
         return Ok(());
     }
@@ -178,7 +179,7 @@ async fn handle_text(env: Env, chat_id: i64, text: String) -> Result<()> {
         }
     };
 
-    match state.text_transition(&text) {
+    match transition {
         TextTransition::Cancel => unreachable!("cancel transition is handled before auth"),
         TextTransition::SavePressure(pending) => {
             delete_state(&kv, &state_key, chat_id).await?;

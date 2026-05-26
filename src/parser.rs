@@ -97,9 +97,11 @@ impl ParserService {
         let mut comment_parts = Vec::new();
 
         for p in parts {
-            if let Ok(num) = p.parse::<i32>()
-                && amount.is_none()
-            {
+            if amount.is_none() {
+                let Ok(num) = p.parse::<i32>() else {
+                    comment_parts.push(p);
+                    continue;
+                };
                 amount = Some(num);
                 continue;
             }
@@ -181,8 +183,10 @@ impl ParserService {
                     if depth == 0 {
                         if let Some(start_idx) = start {
                             let json_str = &text[start_idx..=idx];
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str)
-                                && let Some(result) = Self::pressure_from_json_value(&value)
+                            if let Some(result) =
+                                serde_json::from_str::<serde_json::Value>(json_str)
+                                    .ok()
+                                    .and_then(|value| Self::pressure_from_json_value(&value))
                             {
                                 last_valid = Some(result);
                             }
