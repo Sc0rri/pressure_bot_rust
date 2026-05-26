@@ -13,9 +13,9 @@ It processes incoming Telegram webhooks, parses blood pressure or expense inputs
 5.  **🛡️ Low CPU Footprint OAuth2 Caching:** Google Sheets API OAuth tokens are cached in Cloudflare KV with a 55-minute expiration. This drops average request CPU times down to **< 5ms** and ensures you stay safely under the free tier execution limits.
 6.  **📦 Zero Heavy Crypto Bloat:** Uses the pure-Rust `jwt-simple` crate for fast Wasm-compatible RS256 token signing.
 7.  **⏱️ Embedded Timezone Support:** Statically embeds timezone databases using Wasm-compatible `chrono-tz`, preserving precise local spreadsheet timestamps (e.g. `Europe/Kiev`). Worker logs use UTC timestamps via `log_event!`.
-8.  **🌐 Cyrillic Sheets & Custom Range Encoding:** Implements native percent-encoding and automatic single-quote range escaping, handling Cyrillic tab names with spaces and parentheses (like `'Значения (2026 )'!A3`) perfectly.
+8.  **🌐 Cyrillic Sheets & Custom Range Encoding:** Builds quoted Google Sheets ranges and percent-encodes them before API calls, handling Cyrillic tab names with spaces and parentheses (like `'Значения (2026 )'!A3`).
 9.  **📢 Direct Telegram Error Reporting:** Instantly forwards Google Sheets API errors directly to your Telegram chat to prevent silent failures.
-10. **⌨️ Automatic Keyboard Management:** Seamlessly collapses and hides the Telegram custom keyboard when operations are completed or canceled without spamming "Cancelled" messages.
+10. **⌨️ Automatic Keyboard Management:** Collapses and hides Telegram reply keyboards after completed operations. Text cancel clears state silently; inline cancel confirms cancellation.
 
 ---
 
@@ -49,17 +49,17 @@ stateDiagram-v2
 
         AMC --> DiscardAndProcessAMC : text input (Fallback to NoneState)
         
-        NoneState --> ExecuteAction : ParserService::detect_action(text) matches
-        NoneState --> AskUser : No match (unknown action)
+        NoneState --> ExecuteAction : detect_action text matches
+        NoneState --> AskUser : unknown action
         
-        AskUser --> [*] : Save AwaitingClassification state to KV & show keyboard
-        SavePressure --> [*] : Execute add_pressure & clear KV
-        SaveForcedPressure --> [*] : Execute add_pressure & clear KV
-        SaveForcedCost --> [*] : Execute add_cost & clear KV
+        AskUser --> [*] : save AwaitingClassification to KV and show keyboard
+        SavePressure --> [*] : add_pressure and clear KV
+        SaveForcedPressure --> [*] : add_pressure and clear KV
+        SaveForcedCost --> [*] : add_cost and clear KV
     }
     
     ProcessInput --> UniversalCancel : text == "❌ Cancel"
-    UniversalCancel --> [*] : Clear state in KV silently
+    UniversalCancel --> [*] : clear state in KV silently
 ```
 
 ### 1. Photo Recognition Flow (with Multi-Attempt Optimization)
@@ -71,7 +71,7 @@ When a user sends a photo:
 - **0 unique readings**: Shows an error and asks the user to enter pressure manually.
 - **1 unique reading**: Saves as `UserState::AwaitingPressureConfirmation`, offers **✅ Save** / **❌ Cancel** keyboard.
 - **2+ unique readings**: Saves as `UserState::AwaitingMultipleChoice { options }`, shows inline keyboard with "Вариант 1", "Вариант 2", ... buttons for selection.
-- On selection or **✅ Save**: logs to Google Sheets Pressure tab.
+- On inline selection: logs the chosen value to the Google Sheets Pressure tab. On **✅ Save** after a single recognized value: logs the pending value.
 
 ### 2. Security & Access Check
 Every request received at `/webhook` is authenticated. The bot verifies that the message sender's Telegram username matches the secure `ALLOWED_USERNAME` secret. Unauthorized messages are discarded instantly.
@@ -103,7 +103,7 @@ npx wrangler kv namespace create STATE_STORE
 npx wrangler kv namespace create STATE_STORE --preview
 ```
 
-Open your **[wrangler.toml](file:///home/alex/pressure_bot_rust/wrangler.toml)** and replace the `id` (and optionally `preview_id`) values with the output from the commands above:
+Open [`wrangler.toml`](./wrangler.toml) and replace the `id` value with the output from the production namespace command. Add `preview_id` only if you use a separate preview namespace:
 
 ```toml
 [[kv_namespaces]]
@@ -189,7 +189,7 @@ curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo
 
 ```
 ├── Cargo.toml         # Optimized dependency tree (worker, base64, jwt-simple, chrono, futures)
-├── wrangler.toml      # KV bindings, AI binding, build targets, metadata
+├── wrangler.toml      # Worker name, build command, KV binding, AI binding, observability
 ├── src/
 │   ├── lib.rs         # Cloudflare Worker HTTP entrypoint
 │   ├── app.rs         # Telegram update orchestration, KV state IO, photo/text/callback flow
