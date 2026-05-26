@@ -7,7 +7,7 @@ It processes incoming Telegram webhooks, parses blood pressure or expense inputs
 ## ⚡ Features & Enhancements in Rust
 
 1.  **📸 Advanced AI Photo OCR with Multi-Attempt Recognition:** Sends high-resolution images (`photos.last()`) of your blood pressure monitor to **Cloudflare Workers AI** (`@cf/meta/llama-3.2-11b-vision-instruct`) using **multiple parallel requests** (configurable via `AI_VISION_PARALLEL_REQUESTS`, default 4). The vision prompt requires **structured JSON output** (`{"sys": 135, "dia": 85, "pulse": 72}`), making parsing reliable. If multiple different readings are recognized, the bot presents a choice via inline keyboard buttons.
-2.  **📊 Multiple Options Selection:** When AI returns different readings across attempts, the user sees all unique variants with inline buttons ("Вариант 1", "Вариант 2", ...) to pick the correct one.
+2.  **📊 Multiple Options Selection:** When AI returns different readings across attempts, the user sees all unique variants with inline buttons ("Option 1", "Option 2", ...) to pick the correct one.
 3.  **💾 Strongly-Typed State Machine:** Implements a typed finite state machine (`UserState`) serialized as a JSON string in KV. State transitions live in `src/state.rs`, while Worker orchestration lives in `src/app.rs`.
 4.  **⌨️ Centralized UI Button Labels:** Button labels (`✅ Save`, `❌ Cancel`, `🩺 Pressure`, `💸 Cost`) are centralized as public constants in `src/telegram.rs`, making the matching pipeline entirely typo-safe.
 5.  **🛡️ Low CPU Footprint OAuth2 Caching:** Google Sheets API OAuth tokens are cached in Cloudflare KV with a 55-minute expiration. This drops average request CPU times down to **< 5ms** and ensures you stay safely under the free tier execution limits.
@@ -70,7 +70,7 @@ When a user sends a photo:
 - Collects all **unique valid** readings.
 - **0 unique readings**: Shows an error and asks the user to enter pressure manually.
 - **1 unique reading**: Saves as `UserState::AwaitingPressureConfirmation`, offers **✅ Save** / **❌ Cancel** keyboard.
-- **2+ unique readings**: Saves as `UserState::AwaitingMultipleChoice { options }`, shows inline keyboard with "Вариант 1", "Вариант 2", ... buttons for selection.
+- **2+ unique readings**: Saves as `UserState::AwaitingMultipleChoice { options }`, shows inline keyboard with "Option 1", "Option 2", ... buttons for selection.
 - On inline selection: logs the chosen value to the Google Sheets Pressure tab. On **✅ Save** after a single recognized value: logs the pending value.
 
 ### 2. Security & Access Check
