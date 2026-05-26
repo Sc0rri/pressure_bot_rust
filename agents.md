@@ -87,11 +87,13 @@ This is parallel sampling, not retry-after-failure logic.
 
 Access configuration through the `Env` object.
 
-Required secrets:
+Required secrets for text input and Google Sheets writes:
 - `BOT_TOKEN`
 - `ALLOWED_USERNAME`
 - `SHEET_ID`
 - `GOOGLE_CREDENTIALS_JSON`
+
+Required for photo recognition:
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_API_TOKEN`
 
@@ -121,12 +123,12 @@ Use `get_env_or_secret(env, name, default)` for values that support defaults. Ne
 - `google/mod.rs` owns authorized Google HTTP requests.
 - Pressure: inserts a row at index 1 (`batchUpdate` + `insertDimension`), then writes to `A3`.
 - Costs: appends a row via the `:append` endpoint.
-- Cyrillic sheet names are supported via `urlencoding::encode` and single-quote wrapping.
+- Cyrillic sheet names are supported by wrapping the sheet name in single quotes and percent-encoding the full range with `urlencoding::encode`.
 
 ### Inline Keyboard Callback Data
 
-- `confirm_pressure` - confirms pending pressure if an inline confirm flow is used.
-- `cancel_pressure` - cancels pending pressure.
+- `confirm_pressure` - confirms pending pressure; currently handled for compatibility, while the active one-option photo flow uses the `✅ Save` reply keyboard.
+- `cancel_pressure` - cancels pending pressure; currently handled for compatibility, while the active one-option photo flow uses the `❌ Cancel` reply keyboard.
 - `select_option_N` - selects option N from multiple choice, for example `select_option_0`.
 - `cancel_option` - cancels multiple choice.
 - Callback handling lives in `app.rs`.
@@ -149,8 +151,8 @@ Logs include UTC timestamps:
 
 ```bash
 cargo fmt -- --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
 
 npx wrangler build
 npx wrangler deploy
