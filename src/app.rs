@@ -346,8 +346,47 @@ async fn handle_photo(env: Env, chat_id: i64, msg: telegram::Message) -> Result<
         photo.file_size.unwrap_or_default()
     );
 
-    let file_path = TelegramService::get_file_path(&bot_token, &photo.file_id).await?;
-    let image_bytes = TelegramService::download_file(&bot_token, &file_path).await?;
+    let file_path = match TelegramService::get_file_path(&bot_token, &photo.file_id).await {
+        Ok(file_path) => file_path,
+        Err(e) => {
+            crate::log_event!(
+                "error",
+                "telegram.photo.file_path_failed",
+                "chat_id={} error={:?}",
+                chat_id,
+                e
+            );
+            TelegramService::send_message(
+                &bot_token,
+                chat_id,
+                "❌ Failed to retrieve photo from Telegram. Please try again.",
+                Some(TelegramService::remove_keyboard()),
+            )
+            .await?;
+            return Err(e);
+        }
+    };
+
+    let image_bytes = match TelegramService::download_file(&bot_token, &file_path).await {
+        Ok(image_bytes) => image_bytes,
+        Err(e) => {
+            crate::log_event!(
+                "error",
+                "telegram.photo.download_failed",
+                "chat_id={} error={:?}",
+                chat_id,
+                e
+            );
+            TelegramService::send_message(
+                &bot_token,
+                chat_id,
+                "❌ Failed to download photo from Telegram. Please try again.",
+                Some(TelegramService::remove_keyboard()),
+            )
+            .await?;
+            return Err(e);
+        }
+    };
 
     crate::log_event!(
         "info",
