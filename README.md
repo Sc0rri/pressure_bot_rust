@@ -111,7 +111,6 @@ binding = "STATE_STORE"
 id = "YOUR_PRODUCTION_KV_NAMESPACE_ID"
 preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID"  # (Optional)
 ```
-
 ---
 
 ### 2. Configure Cloudflare Secrets
